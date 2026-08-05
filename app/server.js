@@ -3,11 +3,10 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
-const pool = require('./db');
+const pool = require('../config/db');
 
 const app = express();
 const server = http.createServer(app);
-const pool = require('../config/db');
 const ordersRouter = require('../router/orders');
 
 // 1. ตั้งค่า CORS สำหรับ HTTP & WebSockets
