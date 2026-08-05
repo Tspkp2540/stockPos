@@ -100,4 +100,63 @@ router.post('/orders', async (req, res) => {
   }
 });
 
+// 📌 PUT /api/orders/:id/cancel - ยกเลิกออเดอร์ และ คืนสต็อควัตถุดิบ (Rollback Stock)
+router.put('/:id/cancel', async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. ตรวจสอบสถานะออเดอร์
+    const orderRes = await client.query('SELECT status FROM orders WHERE id = $1', [id]);
+    if (orderRes.rows.length === 0) {
+      throw new Error('Order not found');
+    }
+
+    if (orderRes.rows[0].status === 'CANCELLED') {
+      throw new Error('Order is already cancelled');
+    }
+
+    // 2. คืนสต็อควัตถุดิบตามรายการใน Order Items และ Recipes
+    await client.query(
+      `UPDATE ingredients ing
+       SET stock_qty = ing.stock_qty + (r.quantity_used * oi.quantity),
+           updated_at = CURRENT_TIMESTAMP
+       FROM order_items oi
+       JOIN recipes r ON oi.product_id = r.product_id
+       WHERE oi.order_id = $1 AND ing.id = r.ingredient_id`,
+      [id]
+    );
+
+    // 3. อัปเดตสถานะออเดอร์เป็น CANCELLED และล้างยอดเงินกำไรเป็น 0
+    const updatedOrder = await client.query(
+      `UPDATE orders 
+       SET status = 'CANCELLED', net_profit = 0, net_revenue = 0, gp_amount = 0 
+       WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+
+    // ดึง Socket.io จาก app instance มายิงแจ้งเตือน Real-time
+    const io = req.app.get('socketio');
+    if (io) {
+      io.emit('order_cancelled', { orderId: id, message: `ออเดอร์ #${updatedOrder.rows[0].order_no} ถูกยกเลิกและคืนสต็อคแล้ว` });
+    }
+
+    res.json({
+      success: true,
+      message: 'Order cancelled and stock restored successfully',
+      data: updatedOrder.rows[0]
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
