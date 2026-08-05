@@ -1,31 +1,36 @@
 const { Pool } = require('pg');
 
-const hasDatabaseUrl = Boolean(process.env.DATABASE_URL);
+const env = process.env;
+const databaseUrl = env.DATABASE_URL || env.RAILWAY_DATABASE_URL || env.PG_DATABASE_URL || env.POSTGRES_URL;
 const hasStandaloneConfig = Boolean(
-  process.env.PGHOST ||
-  process.env.DB_HOST ||
-  process.env.PGUSER ||
-  process.env.DB_USER ||
-  process.env.PGDATABASE ||
-  process.env.DB_NAME
+  env.PGHOST ||
+  env.DB_HOST ||
+  env.PGUSER ||
+  env.DB_USER ||
+  env.PGDATABASE ||
+  env.DB_NAME
 );
 
 const poolConfig = {};
 
-if (hasDatabaseUrl) {
-  poolConfig.connectionString = process.env.DATABASE_URL;
+if (databaseUrl) {
+  poolConfig.connectionString = databaseUrl;
   poolConfig.ssl = { rejectUnauthorized: false };
 } else if (hasStandaloneConfig) {
-  poolConfig.host = process.env.PGHOST || process.env.DB_HOST || 'localhost';
-  poolConfig.port = parseInt(process.env.PGPORT || process.env.DB_PORT || '5432', 10);
-  poolConfig.user = process.env.PGUSER || process.env.DB_USER || 'postgres';
-  poolConfig.password = process.env.PGPASSWORD || process.env.DB_PASSWORD || '';
-  poolConfig.database = process.env.PGDATABASE || process.env.DB_NAME || 'postgres';
+  poolConfig.host = env.PGHOST || env.DB_HOST || 'localhost';
+  poolConfig.port = parseInt(env.PGPORT || env.DB_PORT || '5432', 10);
+  poolConfig.user = env.PGUSER || env.DB_USER || 'postgres';
+  poolConfig.password = env.PGPASSWORD || env.DB_PASSWORD || '';
+  poolConfig.database = env.PGDATABASE || env.DB_NAME || 'postgres';
 
-  if (process.env.PGSSLMODE && process.env.PGSSLMODE !== 'disable') {
+  if (env.PGSSLMODE && env.PGSSLMODE !== 'disable') {
     poolConfig.ssl = { rejectUnauthorized: false };
   }
 } else {
+  const availableVars = Object.keys(env)
+    .filter((key) => /^(DATABASE_URL|RAILWAY_DATABASE_URL|PG_DATABASE_URL|POSTGRES_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|DB_HOST|DB_PORT|DB_USER|DB_PASSWORD|DB_NAME|PGSSLMODE)$/i.test(key))
+    .sort();
+  console.error('❌ PostgreSQL config not found in environment. Available related vars:', availableVars.join(', ') || '(none)');
   throw new Error(
     'Missing PostgreSQL configuration. Set DATABASE_URL or PGHOST/PGUSER/PGPASSWORD/PGDATABASE in environment variables.'
   );
