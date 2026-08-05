@@ -11,6 +11,18 @@ const hasStandaloneConfig = Boolean(
   env.DB_NAME
 );
 
+console.log('🔎 PostgreSQL env debug:', {
+  DATABASE_URL: Boolean(env.DATABASE_URL),
+  RAILWAY_DATABASE_URL: Boolean(env.RAILWAY_DATABASE_URL),
+  PG_DATABASE_URL: Boolean(env.PG_DATABASE_URL),
+  POSTGRES_URL: Boolean(env.POSTGRES_URL),
+  PGHOST: env.PGHOST || env.DB_HOST || null,
+  PGPORT: env.PGPORT || env.DB_PORT || null,
+  PGUSER: Boolean(env.PGUSER || env.DB_USER),
+  PGDATABASE: env.PGDATABASE || env.DB_NAME || null,
+  PGSSLMODE: env.PGSSLMODE || null
+});
+
 const poolConfig = {};
 
 if (databaseUrl) {
