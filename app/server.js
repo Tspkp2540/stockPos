@@ -9,12 +9,7 @@ const app = express();
 const server = http.createServer(app);
 const ordersRouter = require('../router/orders');
 const inventoryRouter = require('../router/inventory');
-const ordersRouter = require('../router/orders');
 const productsRouter = require('../router/products');
-
-app.use('/api/inventory', inventoryRouter);
-app.use('/api/orders', ordersRouter);
-app.use('/api/products', productsRouter);
 
 const startServer = async () => {
   try {
@@ -40,6 +35,11 @@ startServer();
 // 1. ตั้งค่า CORS สำหรับ HTTP & WebSockets
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+
+// Register routers after middleware
+app.use('/api/inventory', inventoryRouter);
+app.use('/api/orders', ordersRouter);
+app.use('/api/products', productsRouter);
 
 const io = new Server(server, {
   cors: {
