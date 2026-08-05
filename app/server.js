@@ -8,6 +8,13 @@ const pool = require('../config/db');
 const app = express();
 const server = http.createServer(app);
 const ordersRouter = require('../router/orders');
+const inventoryRouter = require('../router/inventory');
+const ordersRouter = require('../router/orders');
+const productsRouter = require('../router/products');
+
+app.use('/api/inventory', inventoryRouter);
+app.use('/api/orders', ordersRouter);
+app.use('/api/products', productsRouter);
 
 const startServer = async () => {
   try {
