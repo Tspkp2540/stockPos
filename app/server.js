@@ -250,7 +250,4 @@ app.put('/api/orders/:id/status', async (req, res) => {
 // ----------------------------------------------------
 // START SERVER
 // ----------------------------------------------------
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
-});
+// Server is started after successful DB connection in startServer()
