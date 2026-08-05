@@ -5,6 +5,15 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const pool = require('../config/db');
 
+// ทดสอบ Test Connection ทันทีที่รัน Server
+pool.connect((err, client, release) => {
+  if (err) {
+    return console.error('❌ Database Connection Error:', err.stack);
+  }
+  console.log('⚡ Connected to Railway PostgreSQL Database Successfully!');
+  release();
+});
+
 const app = express();
 const server = http.createServer(app);
 const ordersRouter = require('../router/orders');
