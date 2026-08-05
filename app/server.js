@@ -5,18 +5,30 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const pool = require('../config/db');
 
-// ทดสอบ Test Connection ทันทีที่รัน Server
-pool.connect((err, client, release) => {
-  if (err) {
-    return console.error('❌ Database Connection Error:', err.stack);
-  }
-  console.log('⚡ Connected to Railway PostgreSQL Database Successfully!');
-  release();
-});
-
 const app = express();
 const server = http.createServer(app);
 const ordersRouter = require('../router/orders');
+
+const startServer = async () => {
+  try {
+    const client = await pool.connect();
+    client.release();
+    console.log('⚡ Connected to PostgreSQL ดDatabase Successfully!');
+
+    const PORT = process.env.PORT || 3000;
+    server.listen(PORT, () => {
+      console.log(`🚀 Server listening on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error('❌ Database Connection Error:', error);
+    if (!process.env.DATABASE_URL && !process.env.PGHOST && !process.env.PGUSER && !process.env.PGDATABASE) {
+      console.error('💡 Please set DATABASE_URL or PGHOST/PGUSER/PGPASSWORD/PGDATABASE (or use a .env file).');
+    }
+    process.exit(1);
+  }
+};
+
+startServer();
 
 // 1. ตั้งค่า CORS สำหรับ HTTP & WebSockets
 app.use(cors({ origin: '*' }));
