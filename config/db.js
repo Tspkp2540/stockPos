@@ -51,7 +51,7 @@ if (databaseUrl) {
 const pool = new Pool(poolConfig);
 
 pool.on('connect', () => {
-  if (hasDatabaseUrl) {
+  if (databaseUrl) {
     console.log('⚡ Connected to PostgreSQL Database using DATABASE_URL');
   } else {
     console.log(`⚡ Connected to PostgreSQL Database (${poolConfig.host}:${poolConfig.port})`);
