@@ -7,6 +7,8 @@ const pool = require('./db');
 
 const app = express();
 const server = http.createServer(app);
+const pool = require('../config/db');
+const ordersRouter = require('../router/orders');
 
 // 1. ตั้งค่า CORS สำหรับ HTTP & WebSockets
 app.use(cors({ origin: '*' }));

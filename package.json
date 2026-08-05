@@ -4,8 +4,8 @@
   "description": "Backend API for F&B 3D Gamified POS and Inventory Management",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node app/server.js",
+    "dev": "nodemon app/server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
