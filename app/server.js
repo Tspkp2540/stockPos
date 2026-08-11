@@ -36,6 +36,15 @@ startServer();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+// Disable caching for API responses to avoid 304 Not Modified in clients
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  next();
+});
+
 // Register routers after middleware
 app.use('/api/inventory', inventoryRouter);
 app.use('/api/orders', ordersRouter);
