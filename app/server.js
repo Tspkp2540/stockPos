@@ -76,6 +76,21 @@ app.get('/api/channels', async (req, res) => {
   }
 });
 
+// 📌 GET /api/orders - ดึงรายการออเดอร์ล่าสุด
+app.get('/api/orders', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, order_no, channel_id, status, gross_amount, net_revenue, created_at
+       FROM orders
+       ORDER BY created_at DESC
+       LIMIT 100`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // 📌 GET /api/inventory - ดึงรายการวัตถุดิบ + ตรวจสอบสินค้าใกล้หมด/ใกล้หมดอายุ
 app.get('/api/inventory', async (req, res) => {
   try {
