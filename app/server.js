@@ -184,6 +184,46 @@ app.post('/api/expenses', async (req, res) => {
   }
 });
 
+// GET /api/expenses - รายการค่าใช้จ่ายทั้งหมด
+app.get('/api/expenses', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM expenses ORDER BY created_at DESC');
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT /api/expenses/:id - แก้ไขรายการค่าใช้จ่าย
+app.put('/api/expenses/:id', async (req, res) => {
+  const amount = Number(req.body?.amount);
+  const category = String(req.body?.category || '').trim();
+  if (!Number.isFinite(amount) || amount <= 0 || !category) {
+    return res.status(400).json({ success: false, error: 'Invalid expense payload' });
+  }
+  try {
+    const result = await pool.query(
+      'UPDATE expenses SET amount = $1, category = $2 WHERE id = $3 RETURNING *',
+      [amount, category, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/expenses/:id - ลบรายการค่าใช้จ่าย
+app.delete('/api/expenses/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM expenses WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // 📌 POST /api/orders - รับออเดอร์ใหม่ (ตัดสต็อคตามสูตร BOM, หัก GP และยิง Socket.io)
 app.post('/api/orders', async (req, res) => {
   const { order_no, channel_id, items } = req.body;
