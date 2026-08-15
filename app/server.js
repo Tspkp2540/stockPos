@@ -19,9 +19,11 @@ const startServer = async () => {
         id BIGSERIAL PRIMARY KEY,
         amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
         category VARCHAR(100) NOT NULL DEFAULT 'OPERATING_EXPENSE',
+        description TEXT NOT NULL DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query('ALTER TABLE expenses ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT \'\'');
     client.release();
     console.log('⚡ Connected to PostgreSQL ดDatabase Successfully!');
 
@@ -168,6 +170,7 @@ app.get('/api/financial-summary', async (req, res) => {
 app.post('/api/expenses', async (req, res) => {
   const amount = Number(req.body?.amount);
   const category = String(req.body?.category || 'OPERATING_EXPENSE').trim();
+  const description = String(req.body?.description || '').trim();
 
   if (!Number.isFinite(amount) || amount <= 0 || !category) {
     return res.status(400).json({ success: false, error: 'Invalid expense payload' });
@@ -175,8 +178,8 @@ app.post('/api/expenses', async (req, res) => {
 
   try {
     const result = await pool.query(
-      'INSERT INTO expenses (amount, category) VALUES ($1, $2) RETURNING *',
-      [amount, category]
+      'INSERT INTO expenses (amount, category, description) VALUES ($1, $2, $3) RETURNING *',
+      [amount, category, description]
     );
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
@@ -198,13 +201,14 @@ app.get('/api/expenses', async (req, res) => {
 app.put('/api/expenses/:id', async (req, res) => {
   const amount = Number(req.body?.amount);
   const category = String(req.body?.category || '').trim();
+  const description = String(req.body?.description || '').trim();
   if (!Number.isFinite(amount) || amount <= 0 || !category) {
     return res.status(400).json({ success: false, error: 'Invalid expense payload' });
   }
   try {
     const result = await pool.query(
-      'UPDATE expenses SET amount = $1, category = $2 WHERE id = $3 RETURNING *',
-      [amount, category, req.params.id]
+      'UPDATE expenses SET amount = $1, category = $2, description = $3 WHERE id = $4 RETURNING *',
+      [amount, category, description, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
     res.json({ success: true, data: result.rows[0] });
