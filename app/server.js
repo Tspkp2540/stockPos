@@ -337,6 +337,124 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
+// PUT /api/orders/:id - แก้ไข sales record พร้อมคำนวณยอดและสต็อกใหม่
+app.put('/api/orders/:id', async (req, res) => {
+  const { id } = req.params;
+  const { order_no, channel_id, items, status = 'COMPLETED' } = req.body || {};
+  const allowedStatuses = new Set(['COOKING', 'COMPLETED']);
+  if (!order_no || !channel_id || !Array.isArray(items) || !items.length || !allowedStatuses.has(status)) {
+    return res.status(400).json({ success: false, error: 'Invalid sales record payload' });
+  }
+
+  const normalizedItems = items.map((item) => ({
+    product_id: Number(item.product_id),
+    qty: Number(item.qty),
+    price: Number(item.price),
+  }));
+  if (normalizedItems.some((item) => !Number.isInteger(item.product_id) || item.qty <= 0 || !Number.isFinite(item.price) || item.price < 0)) {
+    return res.status(400).json({ success: false, error: 'Invalid sales item' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const orderResult = await client.query('SELECT id, status FROM orders WHERE id = $1 FOR UPDATE', [id]);
+    if (!orderResult.rows.length) throw new Error('Order not found');
+    if (orderResult.rows[0].status === 'CANCELLED') throw new Error('Cancelled sales records cannot be edited');
+
+    const channelResult = await client.query('SELECT gp_percent FROM channels WHERE id = $1', [channel_id]);
+    if (!channelResult.rows.length) throw new Error('Invalid channel_id');
+
+    // คืนสต็อกของ record เดิมก่อน แล้วจึงตรวจสอบและตัดตามรายการใหม่
+    await client.query(
+      `UPDATE ingredients ing
+       SET stock_qty = ing.stock_qty + (r.quantity_used * oi.quantity), updated_at = CURRENT_TIMESTAMP
+       FROM order_items oi
+       JOIN recipes r ON r.product_id = oi.product_id
+       WHERE oi.order_id = $1 AND ing.id = r.ingredient_id`,
+      [id]
+    );
+    await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
+
+    let grossAmount = 0;
+    let totalCogs = 0;
+    for (const item of normalizedItems) {
+      const productResult = await client.query('SELECT id FROM products WHERE id = $1', [item.product_id]);
+      if (!productResult.rows.length) throw new Error(`Product #${item.product_id} not found`);
+      const recipeResult = await client.query(
+        `SELECT r.ingredient_id, r.quantity_used, i.name, i.stock_qty, i.cost_per_unit
+         FROM recipes r JOIN ingredients i ON i.id = r.ingredient_id
+         WHERE r.product_id = $1 FOR UPDATE`,
+        [item.product_id]
+      );
+      for (const recipeItem of recipeResult.rows) {
+        const requiredQty = Number(recipeItem.quantity_used) * item.qty;
+        if (Number(recipeItem.stock_qty) < requiredQty) throw new Error(`Insufficient stock for ${recipeItem.name}`);
+        totalCogs += requiredQty * Number(recipeItem.cost_per_unit || 0);
+      }
+      const subtotal = item.qty * item.price;
+      grossAmount += subtotal;
+      await client.query(
+        'INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal) VALUES ($1, $2, $3, $4, $5)',
+        [id, item.product_id, item.qty, item.price, subtotal]
+      );
+      await client.query(
+        `UPDATE ingredients ing SET stock_qty = ing.stock_qty - (r.quantity_used * $1), updated_at = CURRENT_TIMESTAMP
+         FROM recipes r WHERE ing.id = r.ingredient_id AND r.product_id = $2`,
+        [item.qty, item.product_id]
+      );
+    }
+
+    const gpAmount = grossAmount * (Number(channelResult.rows[0].gp_percent) / 100);
+    const netRevenue = grossAmount - gpAmount;
+    const netProfit = netRevenue - totalCogs;
+    const updated = await client.query(
+      `UPDATE orders SET order_no = $1, channel_id = $2, status = $3, gross_amount = $4, gp_amount = $5,
+       net_revenue = $6, total_cogs = $7, net_profit = $8 WHERE id = $9 RETURNING *`,
+      [order_no, channel_id, status, grossAmount, gpAmount, netRevenue, totalCogs, netProfit, id]
+    );
+    await client.query('COMMIT');
+    io.emit('order_updated', { order: updated.rows[0] });
+    res.json({ success: true, data: updated.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.message === 'Order not found' ? 404 : 400).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/orders/:id - ลบ sales record และคืนสต็อกหากยังไม่ถูกยกเลิก
+app.delete('/api/orders/:id', async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const orderResult = await client.query('SELECT id, status FROM orders WHERE id = $1 FOR UPDATE', [id]);
+    if (!orderResult.rows.length) throw new Error('Order not found');
+    if (orderResult.rows[0].status !== 'CANCELLED') {
+      await client.query(
+        `UPDATE ingredients ing
+         SET stock_qty = ing.stock_qty + (r.quantity_used * oi.quantity), updated_at = CURRENT_TIMESTAMP
+         FROM order_items oi
+         JOIN recipes r ON r.product_id = oi.product_id
+         WHERE oi.order_id = $1 AND ing.id = r.ingredient_id`,
+        [id]
+      );
+    }
+    await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
+    await client.query('DELETE FROM orders WHERE id = $1', [id]);
+    await client.query('COMMIT');
+    io.emit('order_deleted', { orderId: Number(id) });
+    res.json({ success: true, data: { id: Number(id) } });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.message === 'Order not found' ? 404 : 400).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // 📌 PUT /api/orders/:id/status - อัปเดตสถานะออเดอร์ (เช่น COOKING -> COMPLETED)
 app.put('/api/orders/:id/status', async (req, res) => {
   const { id } = req.params;
