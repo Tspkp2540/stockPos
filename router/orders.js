@@ -33,6 +33,21 @@ router.post('/orders', async (req, res) => {
       const subtotal = item.qty * item.price;
       grossAmount += subtotal;
 
+      const recipeRes = await client.query(
+        `SELECT r.ingredient_id, r.quantity_used, i.name, i.stock_qty
+         FROM recipes r
+         JOIN ingredients i ON i.id = r.ingredient_id
+         WHERE r.product_id = $1
+         FOR UPDATE`,
+        [item.product_id]
+      );
+      for (const recipeItem of recipeRes.rows) {
+        const requiredQty = Number(recipeItem.quantity_used) * Number(item.qty);
+        if (Number(recipeItem.stock_qty) < requiredQty) {
+          throw new Error(`Insufficient stock for ${recipeItem.name}: required ${requiredQty}, available ${recipeItem.stock_qty}`);
+        }
+      }
+
       // 4.1 บันทึกรายการลง order_items
       await client.query(
         `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)

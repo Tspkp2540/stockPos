@@ -42,6 +42,43 @@ router.post('/', async (req, res) => {
   }
 });
 
+// PUT /api/inventory/:id - แก้ไขวัตถุดิบ
+router.put('/:id', async (req, res) => {
+  const { name, unit, stock_qty, cost_per_unit, min_stock_alert, expiry_date } = req.body;
+  const stock = Number(stock_qty);
+
+  if (!name || !unit || !Number.isFinite(stock) || stock < 0) {
+    return res.status(400).json({ success: false, error: 'Invalid inventory payload' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE ingredients
+       SET name = $1, unit = $2, stock_qty = $3, cost_per_unit = $4,
+           min_stock_alert = $5, expiry_date = $6, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $7
+       RETURNING *, CASE WHEN stock_qty <= min_stock_alert THEN true ELSE false END AS is_low_stock`,
+      [name, unit, stock, Number(cost_per_unit || 0), Number(min_stock_alert || 0), expiry_date || null, req.params.id]
+    );
+
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Ingredient not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/inventory/:id - ลบวัตถุดิบ
+router.delete('/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM ingredients WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Ingredient not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // 📌 POST /api/inventory/restock - เติมสต็อควัตถุดิบ
 router.post('/restock', async (req, res) => {
   const { ingredient_id, qty_to_add, new_cost_per_unit } = req.body;
