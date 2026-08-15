@@ -14,6 +14,14 @@ const productsRouter = require('../router/products');
 const startServer = async () => {
   try {
     const client = await pool.connect();
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS expenses (
+        id BIGSERIAL PRIMARY KEY,
+        amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+        category VARCHAR(100) NOT NULL DEFAULT 'OPERATING_EXPENSE',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
     client.release();
     console.log('⚡ Connected to PostgreSQL ดDatabase Successfully!');
 
@@ -143,12 +151,34 @@ app.get('/api/financial-summary', async (req, res) => {
         COALESCE(SUM(net_revenue), 0) AS total_net_revenue,
         COALESCE(SUM(total_cogs), 0) AS total_cogs,
         COALESCE(SUM(net_profit), 0) AS total_net_profit,
-        COUNT(id) AS total_orders
+        COUNT(id) AS total_orders,
+        (SELECT COALESCE(SUM(amount), 0) FROM expenses
+         WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Bangkok') = CURRENT_DATE) AS total_expenses
       FROM orders
       WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Bangkok') = CURRENT_DATE;
     `;
     const result = await pool.query(query);
     res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/expenses - บันทึกค่าใช้จ่ายประจำวัน
+app.post('/api/expenses', async (req, res) => {
+  const amount = Number(req.body?.amount);
+  const category = String(req.body?.category || 'OPERATING_EXPENSE').trim();
+
+  if (!Number.isFinite(amount) || amount <= 0 || !category) {
+    return res.status(400).json({ success: false, error: 'Invalid expense payload' });
+  }
+
+  try {
+    const result = await pool.query(
+      'INSERT INTO expenses (amount, category) VALUES ($1, $2) RETURNING *',
+      [amount, category]
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
