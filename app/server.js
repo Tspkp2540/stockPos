@@ -56,6 +56,7 @@ const io = new Server(server, {
     methods: ['GET', 'POST', 'PUT', 'DELETE']
   }
 });
+app.set('socketio', io);
 
 // 2. จัดการการเชื่อมต่อ WebSockets (สำหรับ Real-time 3D Scene Updates)
 io.on('connection', (socket) => {
@@ -89,9 +90,23 @@ app.get('/api/channels', async (req, res) => {
 app.get('/api/orders', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, order_no, channel_id, status, gross_amount, net_revenue, created_at
-       FROM orders
-       ORDER BY created_at DESC
+      `SELECT o.id, o.order_no, o.channel_id, c.name AS channel_name, o.status,
+              o.gross_amount, o.gp_amount, o.total_cogs, o.net_revenue, o.net_profit, o.created_at,
+              COALESCE(
+                JSON_AGG(JSON_BUILD_OBJECT(
+                  'product_id', oi.product_id,
+                  'name', p.name,
+                  'quantity', oi.quantity,
+                  'unit_price', oi.unit_price,
+                  'subtotal', oi.subtotal
+                ) ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
+              ) AS items
+       FROM orders o
+       LEFT JOIN channels c ON c.id = o.channel_id
+       LEFT JOIN order_items oi ON oi.order_id = o.id
+       LEFT JOIN products p ON p.id = oi.product_id
+       GROUP BY o.id, c.name
+       ORDER BY o.created_at DESC
        LIMIT 100`
     );
     res.json({ success: true, data: result.rows });
