@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
+const { requireRoles } = require('../middleware/auth');
 
 // 📌 GET /api/products - ดึงรายการสินค้าทั้งหมด พร้อมสูตรอาหาร (BOM)
 router.get('/', async (req, res) => {
@@ -28,6 +29,8 @@ router.get('/', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+router.use(requireRoles('ADMIN'));
 
 // 📌 POST /api/products - เพิ่มสินค้าใหม่
 router.post('/', async (req, res) => {

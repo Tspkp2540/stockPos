@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
+const { requireRoles } = require('../middleware/auth');
 
 // POST /api/orders - รับออเดอร์ใหม่
-router.post('/orders', async (req, res) => {
+router.post('/orders', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   const { order_no, channel_id, items } = req.body;
   // items ตัวอย่าง: [ { product_id: 1, qty: 2, price: 50.00 } ]
 
@@ -97,7 +98,7 @@ router.post('/orders', async (req, res) => {
     // 8. ยิง Real-time Event ผ่าน Socket.io ไปอัปเดตหน้าจอ 3D
     const io = req.app.get('socketio');
     if (io) {
-      io.emit('new_order_created', {
+      io.to('operations').emit('new_order_created', {
         order: createdOrder,
         message: `มีออเดอร์ใหม่ #${order_no} เข้ามาแล้ว!`
       });
@@ -116,7 +117,7 @@ router.post('/orders', async (req, res) => {
 });
 
 // 📌 PUT /api/orders/:id/cancel - ยกเลิกออเดอร์ และ คืนสต็อควัตถุดิบ (Rollback Stock)
-router.put('/:id/cancel', async (req, res) => {
+router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
 
@@ -157,7 +158,7 @@ router.put('/:id/cancel', async (req, res) => {
     // ดึง Socket.io จาก app instance มายิงแจ้งเตือน Real-time
     const io = req.app.get('socketio');
     if (io) {
-      io.emit('order_cancelled', { orderId: id, message: `ออเดอร์ #${updatedOrder.rows[0].order_no} ถูกยกเลิกและคืนสต็อคแล้ว` });
+      io.to('operations').emit('order_cancelled', { orderId: id, message: `ออเดอร์ #${updatedOrder.rows[0].order_no} ถูกยกเลิกและคืนสต็อคแล้ว` });
     }
 
     res.json({
