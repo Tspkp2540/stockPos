@@ -387,7 +387,8 @@ app.delete('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, 
 app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   const { order_no, channel_id, items } = req.body;
   const recordDate = selectedRecordDate(req.body?.record_date);
-  const customerNickname = String(req.body?.customer_nickname || '').trim().slice(0, 80);
+  const customerName = String(req.body?.customer_name || req.body?.customer_nickname || '').trim().slice(0, 120);
+  const customerNickname = String(req.body?.customer_nickname || customerName).trim().slice(0, 80);
   const customerPhone = normalizePhone(req.body?.customer_phone);
   // ตัวอย่าง items: [ { product_id: 1, qty: 2, price: 50.00 } ]
 
@@ -427,10 +428,10 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 
     // 2. สร้าง Order เริ่มต้น
     const orderRes = await client.query(
-      `INSERT INTO orders (order_no, channel_id, gross_amount, net_revenue, status, created_at, customer_nickname, customer_phone, queue_no)
-       VALUES ($1, $2, 0, 0, 'COOKING', COALESCE($3::date::timestamp AT TIME ZONE 'Asia/Bangkok', CURRENT_TIMESTAMP), $4, $5, $6)
+      `INSERT INTO orders (order_no, channel_id, gross_amount, net_revenue, status, created_at, customer_name, customer_nickname, customer_phone, queue_no)
+       VALUES ($1, $2, 0, 0, 'COOKING', COALESCE($3::date::timestamp AT TIME ZONE 'Asia/Bangkok', CURRENT_TIMESTAMP), $4, $5, $6, $7)
        RETURNING id`,
-      [order_no, channel_id, recordDate, customerNickname || null, customerPhone || null, queueNo]
+      [order_no, channel_id, recordDate, customerName || null, customerNickname || null, customerPhone || null, queueNo]
     );
     const orderId = orderRes.rows[0].id;
 
