@@ -30,6 +30,8 @@ const verifyPassword = (password, stored) => {
   return verifyLegacyPassword(password, storedHash);
 };
 
+const needsPasswordUpgrade = (stored) => String(stored || '').startsWith('scrypt$');
+
 const createToken = (user) => {
   if (!secret()) throw new Error('AUTH_SECRET is not configured');
   const payload = {
@@ -72,4 +74,4 @@ const requireRoles = (...allowedRoles) => (req, res, next) => {
   next();
 };
 
-module.exports = { hashPassword, verifyPassword, createToken, verifyToken, requireAuth, requireRoles };
+module.exports = { hashPassword, verifyPassword, needsPasswordUpgrade, createToken, verifyToken, requireAuth, requireRoles };

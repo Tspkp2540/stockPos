@@ -4,7 +4,7 @@ const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
 const pool = require('../config/db');
-const { hashPassword, verifyPassword, createToken, verifyToken, requireAuth, requireRoles } = require('../middleware/auth');
+const { hashPassword, verifyPassword, needsPasswordUpgrade, createToken, verifyToken, requireAuth, requireRoles } = require('../middleware/auth');
 
 const app = express();
 const server = http.createServer(app);
@@ -123,6 +123,9 @@ app.post('/api/auth/login', async (req, res) => {
     const result = await pool.query('SELECT id, username, full_name, phone, password_hash, role FROM users WHERE username = $1', [username]);
     const user = result.rows[0];
     if (!user || !verifyPassword(password, user.password_hash)) return res.status(401).json({ success: false, error: 'Invalid username or password' });
+    if (needsPasswordUpgrade(user.password_hash)) {
+      await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(password), user.id]);
+    }
     res.json({ success: true, data: { user: publicUser(user), token: createToken(user) } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
