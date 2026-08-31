@@ -22,6 +22,23 @@ const selectedRecordDate = (value) => isValidRecordDate(value) ? value : null;
 const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
 const isValidPhone = (value) => /^\d{9,15}$/.test(value);
 const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase() });
+const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
+const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+const couponDiscountFor = (coupon, amount) => {
+  const base = Math.max(0, Number(amount) || 0);
+  const value = Math.max(0, Number(coupon.discount_value) || 0);
+  const rawDiscount = coupon.discount_type === 'PERCENT' ? base * Math.min(value, 100) / 100 : value;
+  const maxDiscount = Number(coupon.max_discount_amount || 0);
+  return Math.min(base, maxDiscount > 0 ? Math.min(rawDiscount, maxDiscount) : rawDiscount);
+};
+const validateCouponForAmount = (coupon, amount) => {
+  if (!coupon || !coupon.is_active) throw requestError('Coupon is not available');
+  if (coupon.valid_from && new Date(coupon.valid_from) > new Date()) throw requestError('Coupon has not started yet');
+  if (coupon.valid_until && new Date(coupon.valid_until) < new Date()) throw requestError('Coupon has expired');
+  if (coupon.usage_limit !== null && Number(coupon.used_count) >= Number(coupon.usage_limit)) throw requestError('Coupon usage limit has been reached');
+  if (Number(amount) < Number(coupon.min_order_amount || 0)) throw requestError(`Coupon requires a minimum order of ${Number(coupon.min_order_amount).toFixed(2)}`);
+  return couponDiscountFor(coupon, amount);
+};
 
 const startServer = async () => {
   try {
@@ -44,6 +61,29 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_nickname VARCHAR(80)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS queue_no INTEGER');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS coupons (
+        id BIGSERIAL PRIMARY KEY,
+        code VARCHAR(64) NOT NULL UNIQUE,
+        discount_type VARCHAR(12) NOT NULL CHECK (discount_type IN ('AMOUNT', 'PERCENT')),
+        discount_value NUMERIC(12, 2) NOT NULL CHECK (discount_value > 0),
+        min_order_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (min_order_amount >= 0),
+        max_discount_amount NUMERIC(12, 2),
+        valid_from TIMESTAMPTZ,
+        valid_until TIMESTAMPTZ,
+        usage_limit INTEGER CHECK (usage_limit IS NULL OR usage_limit > 0),
+        used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS subtotal_amount NUMERIC(12, 2) NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(12, 2) NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS manual_discount_amount NUMERIC(12, 2) NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS coupon_discount_amount NUMERIC(12, 2) NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS coupon_code VARCHAR(64)');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS coupon_id BIGINT REFERENCES coupons(id)');
+    await client.query('CREATE INDEX IF NOT EXISTS coupons_active_code_idx ON coupons(UPPER(code)) WHERE is_active = TRUE');
     await client.query('CREATE INDEX IF NOT EXISTS orders_customer_phone_created_at_idx ON orders(customer_phone, created_at DESC)');
     await client.query(`
       CREATE TABLE IF NOT EXISTS expenses (
@@ -151,6 +191,84 @@ app.get('/api/users/customers', requireAuth, requireRoles('ADMIN', 'STAFF'), asy
   }
 });
 
+app.post('/api/coupons/validate', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const code = normalizeCouponCode(req.body?.code);
+  const amount = Math.max(0, Number(req.body?.amount) || 0);
+  if (!code) return res.status(400).json({ success: false, error: 'Coupon code is required' });
+
+  try {
+    const result = await pool.query(
+      `SELECT id, code, discount_type, discount_value, min_order_amount, max_discount_amount,
+              valid_from, valid_until, usage_limit, used_count, is_active
+       FROM coupons WHERE UPPER(code) = $1`,
+      [code]
+    );
+    const coupon = result.rows[0];
+    const discountAmount = validateCouponForAmount(coupon, amount);
+    res.json({
+      success: true,
+      data: {
+        code: coupon.code,
+        discount_type: coupon.discount_type,
+        discount_value: Number(coupon.discount_value),
+        min_order_amount: Number(coupon.min_order_amount || 0),
+        max_discount_amount: Number(coupon.max_discount_amount || 0),
+        discount_amount: Number(discountAmount.toFixed(2)),
+      }
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/coupons', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, code, discount_type, discount_value, min_order_amount, max_discount_amount,
+              valid_from, valid_until, usage_limit, used_count, is_active, created_at
+       FROM coupons ORDER BY created_at DESC`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/coupons', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const code = normalizeCouponCode(req.body?.code);
+  const discountType = String(req.body?.discount_type || '').toUpperCase();
+  const discountValue = Number(req.body?.discount_value);
+  const minOrderAmount = Math.max(0, Number(req.body?.min_order_amount) || 0);
+  const hasMaxDiscount = req.body?.max_discount_amount !== undefined && req.body?.max_discount_amount !== null && req.body?.max_discount_amount !== '';
+  const hasUsageLimit = req.body?.usage_limit !== undefined && req.body?.usage_limit !== null && req.body?.usage_limit !== '';
+  const maxDiscountAmount = hasMaxDiscount ? Number(req.body.max_discount_amount) : null;
+  const usageLimit = hasUsageLimit ? Number(req.body.usage_limit) : null;
+  const validFrom = req.body?.valid_from || null;
+  const validUntil = req.body?.valid_until || null;
+
+  if (!/^[A-Z0-9_-]{3,64}$/.test(code) || !['AMOUNT', 'PERCENT'].includes(discountType) || !Number.isFinite(discountValue) || discountValue <= 0) {
+    return res.status(400).json({ success: false, error: 'Coupon data is invalid' });
+  }
+  if (discountType === 'PERCENT' && discountValue > 100) return res.status(400).json({ success: false, error: 'Percent discount cannot exceed 100' });
+  if ((maxDiscountAmount !== null && (!Number.isFinite(maxDiscountAmount) || maxDiscountAmount <= 0)) ||
+      (usageLimit !== null && (!Number.isInteger(usageLimit) || usageLimit <= 0))) {
+    return res.status(400).json({ success: false, error: 'Coupon limit data is invalid' });
+  }
+  if (validFrom && validUntil && new Date(validFrom) > new Date(validUntil)) return res.status(400).json({ success: false, error: 'Coupon date range is invalid' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO coupons (code, discount_type, discount_value, min_order_amount, max_discount_amount, usage_limit, valid_from, valid_until)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [code, discountType, discountValue, minOrderAmount, maxDiscountAmount, usageLimit, validFrom, validUntil]
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'Coupon code already exists' });
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Register routers after middleware
 app.use('/api/inventory', requireAuth, requireRoles('ADMIN'), inventoryRouter);
 app.use('/api/orders', requireAuth, ordersRouter);
@@ -244,7 +362,8 @@ app.get('/api/orders', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT o.id, o.order_no, o.queue_no, o.customer_name, o.customer_nickname, o.customer_phone, o.channel_id, c.name AS channel_name, o.status,
-              o.gross_amount, o.gp_amount, o.total_cogs, o.net_revenue, o.net_profit, o.created_at,
+              o.subtotal_amount, o.discount_amount, o.manual_discount_amount, o.coupon_discount_amount,
+              o.coupon_code, o.coupon_id, o.gross_amount, o.gp_amount, o.total_cogs, o.net_revenue, o.net_profit, o.created_at,
               COALESCE(
                 JSON_AGG(JSON_BUILD_OBJECT(
                   'product_id', oi.product_id,
@@ -390,6 +509,11 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
   const customerName = String(req.body?.customer_name || req.body?.customer_nickname || '').trim().slice(0, 120);
   const customerNickname = String(req.body?.customer_nickname || customerName).trim().slice(0, 80);
   const customerPhone = normalizePhone(req.body?.customer_phone);
+  const requestedManualDiscount = Math.max(
+    0,
+    Number(req.body?.manual_discount_amount ?? req.body?.discount_amount) || 0
+  );
+  const requestedCouponCode = normalizeCouponCode(req.body?.coupon_code);
   // ตัวอย่าง items: [ { product_id: 1, qty: 2, price: 50.00 } ]
 
   if (!order_no || !channel_id || !items || !items.length) {
@@ -408,7 +532,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     // 1. ดึงข้อมูลช่องทางขาย (% GP)
     const channelRes = await client.query('SELECT name, gp_percent FROM channels WHERE id = $1', [channel_id]);
     if (channelRes.rows.length === 0) {
-      throw new Error('Invalid channel_id');
+      throw requestError('Invalid channel_id');
     }
     const channelName = channelRes.rows[0].name;
     const gpPercent = parseFloat(channelRes.rows[0].gp_percent);
@@ -423,7 +547,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     );
     const queueNo = Number(queueResult.rows[0].next_queue);
 
-    let grossAmount = 0;
+    let subtotalAmount = 0;
     let totalCogs = 0;
 
     // 2. สร้าง Order เริ่มต้น
@@ -437,14 +561,19 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 
     // 3. วนลูปประมวลผลสินค้าแต่ละรายการ
     for (const item of items) {
-      const subtotal = item.qty * item.price;
-      grossAmount += subtotal;
+      const quantity = Number(item.qty);
+      const unitPrice = Number(item.price);
+      if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
+        throw requestError('Order item quantity and price are invalid');
+      }
+      const subtotal = quantity * unitPrice;
+      subtotalAmount += subtotal;
 
       // 3.1 บันทึกรายการลง order_items
       await client.query(
         `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
          VALUES ($1, $2, $3, $4, $5)`,
-        [orderId, item.product_id, item.qty, item.price, subtotal]
+        [orderId, item.product_id, quantity, unitPrice, subtotal]
       );
 
       // 3.2 ตัดสต็อควัตถุดิบตามสูตร (BOM - Bill of Materials)
@@ -454,7 +583,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
              updated_at = CURRENT_TIMESTAMP
          FROM recipes r
          WHERE ing.id = r.ingredient_id AND r.product_id = $2`,
-        [item.qty, item.product_id]
+        [quantity, item.product_id]
       );
 
       // 3.3 คำนวณต้นทุนวัตถุดิบ (COGS) ของรายการนี้
@@ -463,22 +592,62 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
          FROM recipes r
          JOIN ingredients i ON r.ingredient_id = i.id
          WHERE r.product_id = $2`,
-        [item.qty, item.product_id]
+        [quantity, item.product_id]
       );
       totalCogs += parseFloat(cogsRes.rows[0].item_cogs);
     }
 
-    // 4. คำนวณ GP, รายรับสุทธิ, และกำไรสุทธิ
+    const manualDiscountAmount = Math.min(subtotalAmount, requestedManualDiscount);
+    const couponBaseAmount = subtotalAmount - manualDiscountAmount;
+    let couponDiscountAmount = 0;
+    let couponId = null;
+    let couponCode = null;
+
+    if (requestedCouponCode) {
+      const couponResult = await client.query(
+        `SELECT id, code, discount_type, discount_value, min_order_amount, max_discount_amount,
+                valid_from, valid_until, usage_limit, used_count, is_active
+         FROM coupons
+         WHERE UPPER(code) = $1
+         FOR UPDATE`,
+        [requestedCouponCode]
+      );
+      const coupon = couponResult.rows[0];
+      couponDiscountAmount = validateCouponForAmount(coupon, couponBaseAmount);
+      couponId = coupon.id;
+      couponCode = coupon.code;
+      await client.query('UPDATE coupons SET used_count = used_count + 1 WHERE id = $1', [couponId]);
+    }
+
+    const discountAmount = manualDiscountAmount + couponDiscountAmount;
+    const grossAmount = Math.max(0, subtotalAmount - discountAmount);
+
+    // 4. คำนวณ GP, รายรับสุทธิ, และกำไรสุทธิจากยอดหลังหักส่วนลด
     const gpAmount = grossAmount * (gpPercent / 100);
     const netRevenue = grossAmount - gpAmount;
     const netProfit = netRevenue - totalCogs;
 
     // 5. อัปเดตข้อมูลสรุปกลับลงในออเดอร์
     const updatedOrderRes = await client.query(
-      `UPDATE orders 
-       SET gross_amount = $1, gp_amount = $2, net_revenue = $3, total_cogs = $4, net_profit = $5
-       WHERE id = $6 RETURNING *`,
-      [grossAmount, gpAmount, netRevenue, totalCogs, netProfit, orderId]
+      `UPDATE orders
+       SET subtotal_amount = $1, manual_discount_amount = $2, coupon_discount_amount = $3,
+           discount_amount = $4, coupon_code = $5, coupon_id = $6,
+           gross_amount = $7, gp_amount = $8, net_revenue = $9, total_cogs = $10, net_profit = $11
+       WHERE id = $12 RETURNING *`,
+      [
+        subtotalAmount,
+        manualDiscountAmount,
+        couponDiscountAmount,
+        discountAmount,
+        couponCode,
+        couponId,
+        grossAmount,
+        gpAmount,
+        netRevenue,
+        totalCogs,
+        netProfit,
+        orderId,
+      ]
     );
 
     // ยืนยันการทำ Transaction ลง Database
@@ -504,7 +673,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     // ถ้ามี Error เกิดขึ้น ให้ย้อนกลับ (Rollback) ข้อมูลทั้งหมด
     await client.query('ROLLBACK');
     console.error('❌ Transaction Error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   } finally {
     client.release();
   }
@@ -532,7 +701,10 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const orderResult = await client.query('SELECT id, status FROM orders WHERE id = $1 FOR UPDATE', [id]);
+    const orderResult = await client.query(
+      'SELECT id, status, manual_discount_amount, coupon_discount_amount FROM orders WHERE id = $1 FOR UPDATE',
+      [id]
+    );
     if (!orderResult.rows.length) throw new Error('Order not found');
     if (orderResult.rows[0].status === 'CANCELLED') throw new Error('Cancelled sales records cannot be edited');
 
@@ -550,7 +722,7 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
     );
     await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
 
-    let grossAmount = 0;
+    let subtotalAmount = 0;
     let totalCogs = 0;
     for (const item of normalizedItems) {
       const productResult = await client.query('SELECT id FROM products WHERE id = $1', [item.product_id]);
@@ -566,28 +738,59 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
         if (Number(recipeItem.stock_qty) < requiredQty) throw new Error(`Insufficient stock for ${recipeItem.name}`);
         totalCogs += requiredQty * Number(recipeItem.cost_per_unit || 0);
       }
-      const subtotal = item.qty * item.price;
-      grossAmount += subtotal;
+      const quantity = Number(item.qty);
+      const unitPrice = Number(item.price);
+      if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
+        throw requestError('Order item quantity and price are invalid');
+      }
+      const subtotal = quantity * unitPrice;
+      subtotalAmount += subtotal;
       await client.query(
         'INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal) VALUES ($1, $2, $3, $4, $5)',
-        [id, item.product_id, item.qty, item.price, subtotal]
+        [id, item.product_id, quantity, unitPrice, subtotal]
       );
       await client.query(
         `UPDATE ingredients ing SET stock_qty = ing.stock_qty - (r.quantity_used * $1), updated_at = CURRENT_TIMESTAMP
          FROM recipes r WHERE ing.id = r.ingredient_id AND r.product_id = $2`,
-        [item.qty, item.product_id]
+        [quantity, item.product_id]
       );
     }
 
+    const manualDiscountAmount = Math.min(
+      subtotalAmount,
+      Math.max(0, Number(orderResult.rows[0].manual_discount_amount) || 0)
+    );
+    const couponDiscountAmount = Math.min(
+      subtotalAmount - manualDiscountAmount,
+      Math.max(0, Number(orderResult.rows[0].coupon_discount_amount) || 0)
+    );
+    const discountAmount = manualDiscountAmount + couponDiscountAmount;
+    const grossAmount = Math.max(0, subtotalAmount - discountAmount);
     const gpAmount = grossAmount * (Number(channelResult.rows[0].gp_percent) / 100);
     const netRevenue = grossAmount - gpAmount;
     const netProfit = netRevenue - totalCogs;
     const updated = await client.query(
-      `UPDATE orders SET order_no = $1, channel_id = $2, status = $3, gross_amount = $4, gp_amount = $5,
-       net_revenue = $6, total_cogs = $7, net_profit = $8,
-       created_at = COALESCE($9::date::timestamp AT TIME ZONE 'Asia/Bangkok', created_at)
-       WHERE id = $10 RETURNING *`,
-      [order_no, channel_id, status, grossAmount, gpAmount, netRevenue, totalCogs, netProfit, recordDate, id]
+      `UPDATE orders SET order_no = $1, channel_id = $2, status = $3,
+       subtotal_amount = $4, manual_discount_amount = $5, coupon_discount_amount = $6, discount_amount = $7,
+       gross_amount = $8, gp_amount = $9, net_revenue = $10, total_cogs = $11, net_profit = $12,
+       created_at = COALESCE($13::date::timestamp AT TIME ZONE 'Asia/Bangkok', created_at)
+       WHERE id = $14 RETURNING *`,
+      [
+        order_no,
+        channel_id,
+        status,
+        subtotalAmount,
+        manualDiscountAmount,
+        couponDiscountAmount,
+        discountAmount,
+        grossAmount,
+        gpAmount,
+        netRevenue,
+        totalCogs,
+        netProfit,
+        recordDate,
+        id,
+      ]
     );
     await client.query('COMMIT');
     io.to('operations').emit('order_updated', { order: updated.rows[0] });
