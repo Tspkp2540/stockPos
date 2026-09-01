@@ -1,0 +1,118 @@
+# StockPOS Backend
+
+Backend สำหรับระบบจัดการร้าน StockPOS สร้างด้วย Express, PostgreSQL และ Socket.IO รองรับการขายหน้าร้าน การตัดสต็อก การเงิน ผู้ใช้หลายสิทธิ์ และคูปอง
+
+## ความสามารถของระบบ
+
+- เข้าสู่ระบบและสมัครสมาชิก พร้อมรหัสผ่านแบบ bcrypt
+- แยกสิทธิ์ `ADMIN`, `STAFF` และ `USER` ทุก API ตรวจสอบสิทธิ์ก่อนดำเนินการ
+- สร้างออเดอร์ ตัดวัตถุดิบตามสูตร BOM คำนวณต้นทุน, GP, รายรับสุทธิ และกำไร
+- จัดคิวออเดอร์รายวันแบบปลอดภัยจากเลขคิวซ้ำ
+- อัปเดตสถานะออเดอร์, ยกเลิกออเดอร์ และคืนสต็อกเมื่อยกเลิก
+- บันทึกชื่อเล่น/เบอร์โทรของผู้ซื้อแบบไม่บังคับ เพื่อค้นหาออเดอร์ได้
+- หน้า public lookup ให้ลูกค้าหรือผู้ใช้ทั่วไปติดตามออเดอร์ทั้งหมด หรือกรองด้วยเบอร์โทร
+- จัดการวัตถุดิบ, รับของเข้าสต็อก, เมนูสินค้า, สูตร BOM, ตัวเลือกเมนู (Modifier) และช่องทางขาย
+- บันทึก/แก้ไข/ลบค่าใช้จ่าย และสรุปการเงินตามวันที่
+- ส่วนลดหน้าร้านและคูปอง โดยเก็บยอดก่อนลด ยอดลดแต่ละประเภท และยอดสุทธิในออเดอร์
+- ส่งเหตุการณ์แบบ real-time ผ่าน Socket.IO ให้หน้า POS, คิว และศูนย์ปฏิบัติการอัปเดตทันที
+
+## สิทธิ์การใช้งาน
+
+| สิทธิ์ | การใช้งาน |
+| --- | --- |
+| `ADMIN` | จัดการทุกส่วน: สต็อก เมนู การเงิน รายการขาย ค่าใช้จ่าย คูปอง และออเดอร์ |
+| `STAFF` | สร้างและดูแลการขาย/ออเดอร์ ตรวจคูปอง และอัปเดตสถานะออเดอร์ |
+| `USER` | ดูข้อมูลและประวัติออเดอร์ของตนเอง |
+| ผู้เยี่ยมชม | เปิด dashboard ตรวจสอบคิวออเดอร์ และกรองด้วยเบอร์โทรได้โดยไม่ต้องเข้าสู่ระบบ |
+
+## ส่วนลดและคูปอง
+
+เมื่อสร้างออเดอร์ ระบบจะคำนวณยอดจาก backend ภายใน transaction เดียวกับการตัดสต็อก เพื่อให้รายงานการเงินเชื่อถือได้
+
+1. เก็บ `subtotal_amount` เป็นยอดก่อนลด
+2. หัก `manual_discount_amount` สำหรับส่วนลดที่พนักงานกรอก
+3. ตรวจคูปองจากยอดหลังหักส่วนลดหน้าร้าน
+4. ตรวจสถานะคูปอง วันเริ่ม/หมดอายุ ยอดขั้นต่ำ จำนวนสิทธิ์ และส่วนลดสูงสุด
+5. เก็บ `coupon_code`, `coupon_id`, `coupon_discount_amount` และ `discount_amount`
+6. คำนวณ GP, รายรับสุทธิ และกำไรจากยอดหลังหักส่วนลด
+
+ตาราง `coupons` รองรับส่วนลดแบบจำนวนเงิน (`AMOUNT`) และเปอร์เซ็นต์ (`PERCENT`) พร้อมยอดขั้นต่ำ, เพดานส่วนลด, ช่วงเวลา และจำนวนครั้งที่ใช้ได้
+
+## ตัวเลือกเมนู (Modifier)
+
+Admin กำหนดกลุ่มตัวเลือกแยกตามเมนูได้ เช่น ระดับหวาน, น้ำแข็ง, ขนาดแก้ว หรือท็อปปิง แต่ละกลุ่มตั้งจำนวนที่ต้องเลือก/เลือกได้สูงสุด และกำหนดส่วนเพิ่มหรือลดราคาได้ ระบบตรวจว่าตัวเลือกเป็นของเมนูนั้นจริงก่อนสร้างออเดอร์ แล้วบันทึกชื่อและราคาของตัวเลือกเป็นข้อมูล snapshot ใน `order_item_modifiers` เพื่อให้ตั๋วและประวัติออเดอร์ไม่เปลี่ยนตามการแก้ไขเมนูภายหลัง
+
+## การติดตั้งและรัน
+
+1. ติดตั้งแพ็กเกจ
+
+   ```bash
+   npm install
+   ```
+
+2. สร้างไฟล์ `.env` จาก `.env.example` แล้วกำหนดค่าอย่างน้อย:
+
+   ```env
+   DATABASE_URL=postgres://username:password@hostname:5432/database_name
+   AUTH_SECRET=replace_with_a_long_random_secret
+   PORT=8080
+   ```
+
+3. รันสำหรับพัฒนา
+
+   ```bash
+   npm run dev
+   ```
+
+   หรือรัน production:
+
+   ```bash
+   npm start
+   ```
+
+เมื่อ server เริ่มทำงาน จะสร้าง/เพิ่มโครงสร้างตารางที่จำเป็นแบบไม่ทำลายข้อมูล ได้แก่ `users`, `expenses`, `coupons` และคอลัมน์เพิ่มเติมของ `orders` โดยอัตโนมัติ
+
+สำหรับฐานข้อมูลที่ต้องจัดการ migration เอง ใช้ไฟล์ [database/20260901_add_order_discounts_and_coupons.sql](database/20260901_add_order_discounts_and_coupons.sql)
+
+## API หลัก
+
+ทุก endpoint ใต้ `/api` ที่ระบุว่าป้องกัน ต้องส่ง header:
+
+```http
+Authorization: Bearer <token>
+```
+
+| กลุ่ม | Endpoint หลัก | สิทธิ์ |
+| --- | --- | --- |
+| ตรวจสุขภาพ | `GET /health` | สาธารณะ |
+| ยืนยันตัวตน | `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me` | สาธารณะ / เข้าสู่ระบบ |
+| ติดตามออเดอร์ | `POST /api/public/orders/lookup` | สาธารณะ |
+| ออเดอร์ | `GET/POST /api/orders`, `PUT /api/orders/:id`, `PUT /api/orders/:id/status`, `PUT /api/orders/:id/cancel`, `DELETE /api/orders/:id` | ตามสิทธิ์ |
+| สต็อก | `GET/POST/PUT/DELETE /api/inventory`, `POST /api/inventory/restock` | Admin |
+| เมนู/สูตร | `GET/POST/PUT/DELETE /api/products` | Admin/Staff ตามการดำเนินการ |
+| การเงิน | `GET /api/financial-summary`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
+| คูปอง | `POST /api/coupons/validate`, `GET/POST /api/coupons` | Staff/Admin, Admin |
+| ช่องทางขาย | `GET /api/channels` | Admin/Staff |
+
+ตัวอย่างสร้างคูปองผ่าน SQL:
+
+```sql
+INSERT INTO coupons
+  (code, discount_type, discount_value, min_order_amount, max_discount_amount, usage_limit)
+VALUES
+  ('WELCOME10', 'PERCENT', 10, 100, 50, 100);
+```
+
+## Real-time events
+
+Client เชื่อมต่อ Socket.IO โดยส่ง token ใน `auth.token` ผู้ใช้ทั่วไปจะอยู่ใน room ของตนเอง ส่วน Admin/Staff จะอยู่ใน room `operations` สำหรับรับออเดอร์ใหม่ การเปลี่ยนสถานะ และการยกเลิกออเดอร์
+
+## โครงสร้างสำคัญ
+
+```text
+app/server.js       API หลัก, migration เริ่มต้นระบบ และ Socket.IO
+middleware/auth.js  รหัสผ่าน, token และ role guard
+router/             routes สำหรับสินค้า สต็อก และการยกเลิกออเดอร์
+config/db.js        PostgreSQL connection pool
+database/           SQL migrations สำหรับรันด้วยตนเอง
+```

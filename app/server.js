@@ -39,6 +39,50 @@ const validateCouponForAmount = (coupon, amount) => {
   if (Number(amount) < Number(coupon.min_order_amount || 0)) throw requestError(`Coupon requires a minimum order of ${Number(coupon.min_order_amount).toFixed(2)}`);
   return couponDiscountFor(coupon, amount);
 };
+const resolveItemModifiers = async (client, productId, rawModifiers = []) => {
+  const optionIds = [...new Set(
+    (Array.isArray(rawModifiers) ? rawModifiers : [])
+      .map((modifier) => Number(modifier?.option_id ?? modifier))
+      .filter((id) => Number.isInteger(id) && id > 0)
+  )];
+  const suppliedCount = Array.isArray(rawModifiers) ? rawModifiers.length : 0;
+  if (optionIds.length !== suppliedCount) throw requestError('Invalid modifier selection');
+
+  const groupsResult = await client.query(
+    `SELECT id, name, min_selection, max_selection
+     FROM product_modifier_groups
+     WHERE product_id = $1
+     ORDER BY display_order, id`,
+    [productId]
+  );
+  if (!groupsResult.rows.length) {
+    if (optionIds.length) throw requestError('This menu does not support the selected modifier');
+    return [];
+  }
+
+  const optionsResult = optionIds.length
+    ? await client.query(
+      `SELECT mo.id, mo.name, mo.price_adjustment, mg.id AS group_id, mg.name AS group_name
+       FROM product_modifier_options mo
+       JOIN product_modifier_groups mg ON mg.id = mo.modifier_group_id
+       WHERE mg.product_id = $1 AND mo.id = ANY($2::bigint[]) AND mo.is_active = TRUE`,
+      [productId, optionIds]
+    )
+    : { rows: [] };
+  if (optionsResult.rows.length !== optionIds.length) throw requestError('One or more modifiers are unavailable');
+
+  const selectionsPerGroup = new Map();
+  for (const option of optionsResult.rows) {
+    selectionsPerGroup.set(option.group_id, (selectionsPerGroup.get(option.group_id) || 0) + 1);
+  }
+  for (const group of groupsResult.rows) {
+    const selected = selectionsPerGroup.get(group.id) || 0;
+    if (selected < Number(group.min_selection) || selected > Number(group.max_selection)) {
+      throw requestError(`Please select ${group.name}`);
+    }
+  }
+  return optionsResult.rows;
+};
 
 const startServer = async () => {
   try {
@@ -84,6 +128,39 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS coupon_code VARCHAR(64)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS coupon_id BIGINT REFERENCES coupons(id)');
     await client.query('CREATE INDEX IF NOT EXISTS coupons_active_code_idx ON coupons(UPPER(code)) WHERE is_active = TRUE');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS product_modifier_groups (
+        id BIGSERIAL PRIMARY KEY,
+        product_id BIGINT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        min_selection INTEGER NOT NULL DEFAULT 0 CHECK (min_selection >= 0),
+        max_selection INTEGER NOT NULL DEFAULT 1 CHECK (max_selection > 0),
+        display_order INTEGER NOT NULL DEFAULT 0,
+        CHECK (min_selection <= max_selection)
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS product_modifier_options (
+        id BIGSERIAL PRIMARY KEY,
+        modifier_group_id BIGINT NOT NULL REFERENCES product_modifier_groups(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        price_adjustment NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        display_order INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_item_modifiers (
+        id BIGSERIAL PRIMARY KEY,
+        order_item_id BIGINT NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+        modifier_option_id BIGINT REFERENCES product_modifier_options(id) ON DELETE SET NULL,
+        group_name VARCHAR(100) NOT NULL,
+        option_name VARCHAR(100) NOT NULL,
+        price_adjustment NUMERIC(12, 2) NOT NULL DEFAULT 0
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS product_modifier_groups_product_idx ON product_modifier_groups(product_id, display_order)');
+    await client.query('CREATE INDEX IF NOT EXISTS order_item_modifiers_item_idx ON order_item_modifiers(order_item_id)');
     await client.query('CREATE INDEX IF NOT EXISTS orders_customer_phone_created_at_idx ON orders(customer_phone, created_at DESC)');
     await client.query(`
       CREATE TABLE IF NOT EXISTS expenses (
@@ -320,7 +397,15 @@ app.post('/api/public/orders/lookup', async (req, res) => {
                 JSON_AGG(JSON_BUILD_OBJECT(
                   'product_id', oi.product_id,
                   'name', p.name,
-                  'quantity', oi.quantity
+                  'quantity', oi.quantity,
+                  'modifiers', COALESCE((
+                    SELECT JSON_AGG(JSON_BUILD_OBJECT(
+                      'group_name', oim.group_name,
+                      'name', oim.option_name
+                    ) ORDER BY oim.id)
+                    FROM order_item_modifiers oim
+                    WHERE oim.order_item_id = oi.id
+                  ), '[]'::json)
                 ) ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
               ) AS items
        FROM orders o
@@ -370,7 +455,17 @@ app.get('/api/orders', requireAuth, async (req, res) => {
                   'name', p.name,
                   'quantity', oi.quantity,
                   'unit_price', oi.unit_price,
-                  'subtotal', oi.subtotal
+                  'subtotal', oi.subtotal,
+                  'modifiers', COALESCE((
+                    SELECT JSON_AGG(JSON_BUILD_OBJECT(
+                      'option_id', oim.modifier_option_id,
+                      'group_name', oim.group_name,
+                      'name', oim.option_name,
+                      'price_adjustment', oim.price_adjustment
+                    ) ORDER BY oim.id)
+                    FROM order_item_modifiers oim
+                    WHERE oim.order_item_id = oi.id
+                  ), '[]'::json)
                 ) ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
               ) AS items
        FROM orders o
@@ -566,15 +661,30 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
       if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
         throw requestError('Order item quantity and price are invalid');
       }
-      const subtotal = quantity * unitPrice;
+      const selectedModifiers = await resolveItemModifiers(client, item.product_id, item.modifiers);
+      const modifierAdjustment = selectedModifiers.reduce(
+        (sum, modifier) => sum + Number(modifier.price_adjustment || 0),
+        0
+      );
+      const finalUnitPrice = unitPrice + modifierAdjustment;
+      if (finalUnitPrice < 0) throw requestError('Modifier adjustment makes item price invalid');
+      const subtotal = quantity * finalUnitPrice;
       subtotalAmount += subtotal;
 
       // 3.1 บันทึกรายการลง order_items
-      await client.query(
+      const orderItemResult = await client.query(
         `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [orderId, item.product_id, quantity, unitPrice, subtotal]
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [orderId, item.product_id, quantity, finalUnitPrice, subtotal]
       );
+      const orderItemId = orderItemResult.rows[0].id;
+      for (const modifier of selectedModifiers) {
+        await client.query(
+          `INSERT INTO order_item_modifiers (order_item_id, modifier_option_id, group_name, option_name, price_adjustment)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [orderItemId, modifier.id, modifier.group_name, modifier.name, modifier.price_adjustment]
+        );
+      }
 
       // 3.2 ตัดสต็อควัตถุดิบตามสูตร (BOM - Bill of Materials)
       await client.query(
