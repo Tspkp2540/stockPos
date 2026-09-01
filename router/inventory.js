@@ -230,6 +230,65 @@ router.get('/movements', async (req, res) => {
   }
 });
 
+// ตรวจนับยอดจริงหรือบันทึกของเสีย โดยเก็บส่วนต่างในประวัติการเคลื่อนไหวสต็อก
+router.post('/adjustments', async (req, res) => {
+  const ingredientId = Number(req.body?.ingredient_id);
+  const adjustmentType = String(req.body?.adjustment_type || '').trim().toUpperCase();
+  const note = text(req.body?.note, 1000);
+  if (!Number.isInteger(ingredientId) || ingredientId <= 0 || !['STOCK_COUNT', 'WASTE'].includes(adjustmentType)) {
+    return res.status(400).json({ success: false, error: 'ข้อมูลการปรับยอดไม่ถูกต้อง' });
+  }
+  const actualQuantity = numeric(req.body?.actual_quantity);
+  const wasteQuantity = numeric(req.body?.waste_quantity);
+  if (
+    (adjustmentType === 'STOCK_COUNT' && (!Number.isFinite(actualQuantity) || actualQuantity < 0)) ||
+    (adjustmentType === 'WASTE' && (!Number.isFinite(wasteQuantity) || wasteQuantity <= 0))
+  ) {
+    return res.status(400).json({ success: false, error: 'จำนวนที่ระบุไม่ถูกต้อง' });
+  }
+  if (adjustmentType === 'WASTE' && !note) {
+    return res.status(400).json({ success: false, error: 'กรุณาระบุเหตุผลของของเสีย' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query(
+      'SELECT id, name, stock_qty, cost_per_unit FROM ingredients WHERE id = $1 FOR UPDATE',
+      [ingredientId]
+    );
+    if (!current.rows.length) throw new Error('Ingredient not found');
+    const ingredient = current.rows[0];
+    const currentQty = Number(ingredient.stock_qty || 0);
+    const nextQty = adjustmentType === 'STOCK_COUNT' ? actualQuantity : currentQty - wasteQuantity;
+    if (nextQty < 0) throw new Error('ยอดของเสียมากกว่าสต็อกคงเหลือ');
+    const difference = Number((nextQty - currentQty).toFixed(3));
+    const updated = await client.query(
+      `UPDATE ingredients
+       SET stock_qty = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING *, CASE WHEN stock_qty <= min_stock_alert THEN true ELSE false END AS is_low_stock`,
+      [nextQty, ingredientId]
+    );
+    await client.query(
+      `INSERT INTO inventory_movements
+       (ingredient_id, movement_type, quantity_change, unit_cost, reference_type, note, created_by)
+       VALUES ($1, 'ADJUSTMENT', $2, $3, $4, $5, $6)`,
+      [ingredientId, difference, ingredient.cost_per_unit, adjustmentType, note || 'ตรวจนับสต็อก', req.user?.sub || null]
+    );
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      data: { ingredient: updated.rows[0], difference, adjustment_type: adjustmentType },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.message === 'Ingredient not found' ? 404 : 400).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/inventory - เพิ่มวัตถุดิบใหม่
 router.post('/', async (req, res) => {
   const { name, unit, stock_qty, cost_per_unit, min_stock_alert, expiry_date } = req.body;
