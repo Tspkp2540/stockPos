@@ -16,6 +16,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - ส่วนลดหน้าร้านและคูปอง โดยเก็บยอดก่อนลด ยอดลดแต่ละประเภท และยอดสุทธิในออเดอร์
 - รับชำระด้วยเงินสด, QR, โอน, บัตร หรืออื่น ๆ พร้อมยอดรับและเงินทอน
 - เปิด/ปิดกะเงินสดแยกตามผู้ใช้งาน และคำนวณยอดคาดการณ์กับยอดต่างเมื่อปิดกะ
+- จัดการผู้ขายและใบรับวัตถุดิบเข้า รองรับหลายรายการต่อใบ ปรับต้นทุนเฉลี่ย และเก็บประวัติการเคลื่อนไหวสต็อก
 - ส่งเหตุการณ์แบบ real-time ผ่าน Socket.IO ให้หน้า POS, คิว และศูนย์ปฏิบัติการอัปเดตทันที
 
 ## สิทธิ์การใช้งาน
@@ -53,6 +54,10 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
 ## จอเตรียมสินค้าและใบเสร็จ
 
 สถานะ `READY` ใช้ระบุว่ารายการทำเสร็จและรอลูกค้าหรือ rider มารับสินค้า API `PUT /api/orders/:id/status` รับเฉพาะ `COOKING`, `READY` และ `COMPLETED`; การยกเลิกต้องเรียก `PUT /api/orders/:id/cancel` เพื่อให้คืนสต็อกและทำให้ข้อมูลชำระเงินเป็น `VOIDED` อย่างถูกต้อง
+
+## ผู้ขายและการรับวัตถุดิบเข้า
+
+`suppliers` เก็บข้อมูลผู้ขาย ส่วน `stock_receipts` และ `stock_receipt_items` เก็บใบรับของ ต้นทุนจริง และรายการที่รับเข้า เมื่อสร้างใบรับผ่าน `POST /api/inventory/receipts` ระบบจะ lock วัตถุดิบ, เพิ่มจำนวนคงเหลือ, คำนวณต้นทุนเฉลี่ยถ่วงน้ำหนัก และสร้าง `inventory_movements` ประเภท `PURCHASE` ภายใน transaction เดียวกัน จึงตรวจสอบย้อนกลับได้ว่าของเข้ามาจากใครและต้นทุนเท่าใด
 
 ## การติดตั้งและรัน
 
@@ -105,6 +110,7 @@ Authorization: Bearer <token>
 | การเงิน | `GET /api/financial-summary`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
 | คูปอง | `POST /api/coupons/validate`, `GET/POST /api/coupons` | Staff/Admin, Admin |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
+| ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/movements` | Admin |
 | ช่องทางขาย | `GET /api/channels` | Admin/Staff |
 
 ตัวอย่างสร้างคูปองผ่าน SQL:

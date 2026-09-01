@@ -94,6 +94,60 @@ CREATE UNIQUE INDEX IF NOT EXISTS cash_shifts_one_open_per_user_idx
 CREATE INDEX IF NOT EXISTS order_payments_cash_shift_idx
   ON order_payments(cash_shift_id, status);
 
+-- Supplier and stock receiving: keeps the source, actual purchase cost, and receipt history of inventory.
+CREATE TABLE IF NOT EXISTS suppliers (
+  id BIGSERIAL PRIMARY KEY,
+  name VARCHAR(160) NOT NULL UNIQUE,
+  contact_name VARCHAR(120) NOT NULL DEFAULT '',
+  phone VARCHAR(30) NOT NULL DEFAULT '',
+  email VARCHAR(160) NOT NULL DEFAULT '',
+  address TEXT NOT NULL DEFAULT '',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS stock_receipts (
+  id BIGSERIAL PRIMARY KEY,
+  receipt_no VARCHAR(64) NOT NULL UNIQUE,
+  supplier_id BIGINT REFERENCES suppliers(id) ON DELETE SET NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  note TEXT NOT NULL DEFAULT '',
+  total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
+  created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS stock_receipt_items (
+  id BIGSERIAL PRIMARY KEY,
+  receipt_id BIGINT NOT NULL REFERENCES stock_receipts(id) ON DELETE CASCADE,
+  ingredient_id BIGINT NOT NULL REFERENCES ingredients(id) ON DELETE RESTRICT,
+  quantity NUMERIC(12, 3) NOT NULL CHECK (quantity > 0),
+  unit_cost NUMERIC(12, 2) NOT NULL CHECK (unit_cost >= 0),
+  line_total NUMERIC(12, 2) NOT NULL CHECK (line_total >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS inventory_movements (
+  id BIGSERIAL PRIMARY KEY,
+  ingredient_id BIGINT NOT NULL REFERENCES ingredients(id) ON DELETE RESTRICT,
+  movement_type VARCHAR(24) NOT NULL
+    CHECK (movement_type IN ('INITIAL', 'PURCHASE', 'MANUAL_RESTOCK', 'ADJUSTMENT')),
+  quantity_change NUMERIC(12, 3) NOT NULL,
+  unit_cost NUMERIC(12, 2),
+  reference_type VARCHAR(32) NOT NULL DEFAULT '',
+  reference_id BIGINT,
+  note TEXT NOT NULL DEFAULT '',
+  created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS stock_receipts_received_at_idx
+  ON stock_receipts(received_at DESC);
+CREATE INDEX IF NOT EXISTS stock_receipt_items_receipt_idx
+  ON stock_receipt_items(receipt_id);
+CREATE INDEX IF NOT EXISTS inventory_movements_ingredient_idx
+  ON inventory_movements(ingredient_id, created_at DESC);
+
 -- Example coupon: 10% off, cap at 50 baht, minimum order 100 baht, usable 100 times.
 -- INSERT INTO coupons (code, discount_type, discount_value, min_order_amount, max_discount_amount, usage_limit)
 -- VALUES ('WELCOME10', 'PERCENT', 10, 100, 50, 100);
