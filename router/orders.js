@@ -152,6 +152,12 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
        WHERE id = $1 RETURNING *`,
       [id]
     );
+    await client.query(
+      `UPDATE order_payments
+       SET status = 'VOIDED'
+       WHERE order_id = $1 AND status = 'PAID'`,
+      [id]
+    );
 
     await client.query('COMMIT');
 

@@ -24,6 +24,12 @@ const isValidPhone = (value) => /^\d{9,15}$/.test(value);
 const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase() });
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+const paymentMethods = new Set(['CASH', 'QR', 'TRANSFER', 'CARD', 'OTHER']);
+const normalizePaymentMethod = (value) => {
+  const method = String(value || 'OTHER').trim().toUpperCase();
+  if (!paymentMethods.has(method)) throw requestError('Payment method is invalid');
+  return method;
+};
 const couponDiscountFor = (coupon, amount) => {
   const base = Math.max(0, Number(amount) || 0);
   const value = Math.max(0, Number(coupon.discount_value) || 0);
@@ -161,6 +167,41 @@ const startServer = async () => {
     `);
     await client.query('CREATE INDEX IF NOT EXISTS product_modifier_groups_product_idx ON product_modifier_groups(product_id, display_order)');
     await client.query('CREATE INDEX IF NOT EXISTS order_item_modifiers_item_idx ON order_item_modifiers(order_item_id)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cash_shifts (
+        id BIGSERIAL PRIMARY KEY,
+        opened_by BIGINT NOT NULL REFERENCES users(id),
+        opened_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        opening_cash NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (opening_cash >= 0),
+        opening_note TEXT NOT NULL DEFAULT '',
+        status VARCHAR(12) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+        closed_by BIGINT REFERENCES users(id),
+        closed_at TIMESTAMPTZ,
+        closing_cash NUMERIC(12, 2),
+        expected_cash NUMERIC(12, 2),
+        difference_amount NUMERIC(12, 2),
+        closing_note TEXT NOT NULL DEFAULT ''
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_payments (
+        id BIGSERIAL PRIMARY KEY,
+        order_id BIGINT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+        cash_shift_id BIGINT REFERENCES cash_shifts(id) ON DELETE SET NULL,
+        paid_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        payment_method VARCHAR(16) NOT NULL CHECK (payment_method IN ('CASH', 'QR', 'TRANSFER', 'CARD', 'OTHER')),
+        paid_amount NUMERIC(12, 2) NOT NULL CHECK (paid_amount >= 0),
+        amount_received NUMERIC(12, 2) NOT NULL CHECK (amount_received >= 0),
+        change_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (change_amount >= 0),
+        status VARCHAR(12) NOT NULL DEFAULT 'PAID' CHECK (status IN ('PAID', 'VOIDED')),
+        paid_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS cash_shifts_one_open_per_user_idx
+      ON cash_shifts(opened_by) WHERE status = 'OPEN'
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS order_payments_cash_shift_idx ON order_payments(cash_shift_id, status)');
     await client.query('CREATE INDEX IF NOT EXISTS orders_customer_phone_created_at_idx ON orders(customer_phone, created_at DESC)');
     await client.query(`
       CREATE TABLE IF NOT EXISTS expenses (
@@ -439,6 +480,111 @@ app.get('/api/channels', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req
   }
 });
 
+const shiftWithCashSales = `
+  SELECT cs.*, COALESCE(SUM(op.paid_amount) FILTER (
+    WHERE op.payment_method = 'CASH' AND op.status = 'PAID'
+  ), 0) AS cash_sales
+  FROM cash_shifts cs
+  LEFT JOIN order_payments op ON op.cash_shift_id = cs.id
+`;
+
+app.get('/api/shifts/current', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `${shiftWithCashSales}
+       WHERE cs.opened_by = $1 AND cs.status = 'OPEN'
+       GROUP BY cs.id
+       ORDER BY cs.opened_at DESC
+       LIMIT 1`,
+      [req.user.sub]
+    );
+    res.json({ success: true, data: result.rows[0] || null });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/shifts', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT cs.*, opened_user.full_name AS opened_by_name, COALESCE(SUM(op.paid_amount) FILTER (
+        WHERE op.payment_method = 'CASH' AND op.status = 'PAID'
+      ), 0) AS cash_sales
+       FROM cash_shifts cs
+       LEFT JOIN order_payments op ON op.cash_shift_id = cs.id
+       LEFT JOIN users opened_user ON opened_user.id = cs.opened_by
+       WHERE cs.status IN ('OPEN', 'CLOSED')
+       GROUP BY cs.id, opened_user.full_name
+       ORDER BY cs.opened_at DESC
+       LIMIT 50`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/shifts/open', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const openingCash = Number(req.body?.opening_cash || 0);
+  const openingNote = String(req.body?.opening_note || '').trim().slice(0, 500);
+  if (!Number.isFinite(openingCash) || openingCash < 0) {
+    return res.status(400).json({ success: false, error: 'Opening cash is invalid' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO cash_shifts (opened_by, opening_cash, opening_note)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [req.user.sub, openingCash, openingNote]
+    );
+    res.status(201).json({ success: true, data: { ...result.rows[0], cash_sales: 0 } });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'You already have an open cash shift' });
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/shifts/:id/close', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const closingCash = Number(req.body?.closing_cash);
+  const closingNote = String(req.body?.closing_note || '').trim().slice(0, 500);
+  if (!Number.isFinite(closingCash) || closingCash < 0) {
+    return res.status(400).json({ success: false, error: 'Closing cash is invalid' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const shiftResult = await client.query('SELECT * FROM cash_shifts WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const shift = shiftResult.rows[0];
+    if (!shift) throw requestError('Cash shift not found', 404);
+    if (shift.status !== 'OPEN') throw requestError('Cash shift is already closed', 409);
+    if (req.user.role !== 'ADMIN' && Number(shift.opened_by) !== Number(req.user.sub)) {
+      throw requestError('Only the shift owner or an admin can close this shift', 403);
+    }
+    const cashResult = await client.query(
+      `SELECT COALESCE(SUM(paid_amount), 0) AS cash_sales
+       FROM order_payments
+       WHERE cash_shift_id = $1 AND payment_method = 'CASH' AND status = 'PAID'`,
+      [shift.id]
+    );
+    const cashSales = Number(cashResult.rows[0].cash_sales || 0);
+    const expectedCash = Number(shift.opening_cash || 0) + cashSales;
+    const differenceAmount = closingCash - expectedCash;
+    const updated = await client.query(
+      `UPDATE cash_shifts
+       SET status = 'CLOSED', closed_by = $1, closed_at = CURRENT_TIMESTAMP,
+           closing_cash = $2, expected_cash = $3, difference_amount = $4, closing_note = $5
+       WHERE id = $6 RETURNING *`,
+      [req.user.sub, closingCash, expectedCash, differenceAmount, closingNote, shift.id]
+    );
+    await client.query('COMMIT');
+    res.json({ success: true, data: { ...updated.rows[0], cash_sales: cashSales } });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // 📌 GET /api/orders - ดึงรายการออเดอร์ล่าสุด
 app.get('/api/orders', requireAuth, async (req, res) => {
   const isUser = req.user.role === 'USER';
@@ -449,6 +595,19 @@ app.get('/api/orders', requireAuth, async (req, res) => {
       `SELECT o.id, o.order_no, o.queue_no, o.customer_name, o.customer_nickname, o.customer_phone, o.channel_id, c.name AS channel_name, o.status,
               o.subtotal_amount, o.discount_amount, o.manual_discount_amount, o.coupon_discount_amount,
               o.coupon_code, o.coupon_id, o.gross_amount, o.gp_amount, o.total_cogs, o.net_revenue, o.net_profit, o.created_at,
+              COALESCE((
+                SELECT JSON_BUILD_OBJECT(
+                  'payment_method', op.payment_method,
+                  'paid_amount', op.paid_amount,
+                  'amount_received', op.amount_received,
+                  'change_amount', op.change_amount,
+                  'status', op.status,
+                  'paid_at', op.paid_at
+                )
+                FROM order_payments op
+                WHERE op.order_id = o.id
+                LIMIT 1
+              ), 'null'::json) AS payment,
               COALESCE(
                 JSON_AGG(JSON_BUILD_OBJECT(
                   'product_id', oi.product_id,
@@ -609,6 +768,13 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     Number(req.body?.manual_discount_amount ?? req.body?.discount_amount) || 0
   );
   const requestedCouponCode = normalizeCouponCode(req.body?.coupon_code);
+  let paymentMethod;
+  try {
+    paymentMethod = normalizePaymentMethod(req.body?.payment_method);
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({ success: false, error: error.message });
+  }
+  const requestedAmountReceived = req.body?.amount_received;
   // ตัวอย่าง items: [ { product_id: 1, qty: 2, price: 50.00 } ]
 
   if (!order_no || !channel_id || !items || !items.length) {
@@ -732,6 +898,32 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     const discountAmount = manualDiscountAmount + couponDiscountAmount;
     const grossAmount = Math.max(0, subtotalAmount - discountAmount);
 
+    const paidAmount = grossAmount;
+    let amountReceived = paidAmount;
+    let changeAmount = 0;
+    let cashShiftId = null;
+    if (paymentMethod === 'CASH') {
+      amountReceived = requestedAmountReceived === undefined || requestedAmountReceived === null || requestedAmountReceived === ''
+        ? paidAmount
+        : Number(requestedAmountReceived);
+      if (!Number.isFinite(amountReceived) || amountReceived < paidAmount) {
+        throw requestError('Cash received must cover the order total');
+      }
+      changeAmount = amountReceived - paidAmount;
+      if (paidAmount > 0) {
+        const activeShift = await client.query(
+          `SELECT id FROM cash_shifts
+           WHERE opened_by = $1 AND status = 'OPEN'
+           FOR UPDATE`,
+          [req.user.sub]
+        );
+        if (!activeShift.rows.length) {
+          throw requestError('Open a cash shift before accepting a cash payment', 409);
+        }
+        cashShiftId = activeShift.rows[0].id;
+      }
+    }
+
     // 4. คำนวณ GP, รายรับสุทธิ, และกำไรสุทธิจากยอดหลังหักส่วนลด
     const gpAmount = grossAmount * (gpPercent / 100);
     const netRevenue = grossAmount - gpAmount;
@@ -758,6 +950,13 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
         netProfit,
         orderId,
       ]
+    );
+
+    await client.query(
+      `INSERT INTO order_payments
+       (order_id, cash_shift_id, paid_by, payment_method, paid_amount, amount_received, change_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [orderId, cashShiftId, req.user.sub, paymentMethod, paidAmount, amountReceived, changeAmount]
     );
 
     // ยืนยันการทำ Transaction ลง Database
@@ -902,6 +1101,15 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
         id,
       ]
     );
+
+    await client.query(
+      `UPDATE order_payments
+       SET paid_amount = $1,
+           amount_received = CASE WHEN payment_method = 'CASH' THEN GREATEST(amount_received, $1) ELSE $1 END,
+           change_amount = CASE WHEN payment_method = 'CASH' THEN GREATEST(amount_received, $1) - $1 ELSE 0 END
+       WHERE order_id = $2 AND status = 'PAID'`,
+      [grossAmount, id]
+    );
     await client.query('COMMIT');
     io.to('operations').emit('order_updated', { order: updated.rows[0] });
     res.json({ success: true, data: updated.rows[0] });
@@ -944,10 +1152,15 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
   }
 });
 
-// 📌 PUT /api/orders/:id/status - อัปเดตสถานะออเดอร์ (เช่น COOKING -> COMPLETED)
+// 📌 PUT /api/orders/:id/status - อัปเดตสถานะออเดอร์ (COOKING -> READY -> COMPLETED)
 app.put('/api/orders/:id/status', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   const { id } = req.params;
-  const { status } = req.body; // 'COOKING', 'COMPLETED', 'CANCELLED'
+  const { status } = req.body;
+  const allowedStatuses = new Set(['COOKING', 'READY', 'COMPLETED']);
+
+  if (!allowedStatuses.has(status)) {
+    return res.status(400).json({ success: false, error: 'สถานะออเดอร์ไม่ถูกต้อง' });
+  }
 
   try {
     const result = await pool.query(

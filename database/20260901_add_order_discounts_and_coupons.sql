@@ -59,6 +59,41 @@ CREATE INDEX IF NOT EXISTS product_modifier_groups_product_idx
 CREATE INDEX IF NOT EXISTS order_item_modifiers_item_idx
   ON order_item_modifiers(order_item_id);
 
+CREATE TABLE IF NOT EXISTS cash_shifts (
+  id BIGSERIAL PRIMARY KEY,
+  opened_by BIGINT NOT NULL REFERENCES users(id),
+  opened_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  opening_cash NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (opening_cash >= 0),
+  opening_note TEXT NOT NULL DEFAULT '',
+  status VARCHAR(12) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+  closed_by BIGINT REFERENCES users(id),
+  closed_at TIMESTAMPTZ,
+  closing_cash NUMERIC(12, 2),
+  expected_cash NUMERIC(12, 2),
+  difference_amount NUMERIC(12, 2),
+  closing_note TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS order_payments (
+  id BIGSERIAL PRIMARY KEY,
+  order_id BIGINT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+  cash_shift_id BIGINT REFERENCES cash_shifts(id) ON DELETE SET NULL,
+  paid_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  payment_method VARCHAR(16) NOT NULL
+    CHECK (payment_method IN ('CASH', 'QR', 'TRANSFER', 'CARD', 'OTHER')),
+  paid_amount NUMERIC(12, 2) NOT NULL CHECK (paid_amount >= 0),
+  amount_received NUMERIC(12, 2) NOT NULL CHECK (amount_received >= 0),
+  change_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (change_amount >= 0),
+  status VARCHAR(12) NOT NULL DEFAULT 'PAID' CHECK (status IN ('PAID', 'VOIDED')),
+  paid_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS cash_shifts_one_open_per_user_idx
+  ON cash_shifts(opened_by) WHERE status = 'OPEN';
+
+CREATE INDEX IF NOT EXISTS order_payments_cash_shift_idx
+  ON order_payments(cash_shift_id, status);
+
 -- Example coupon: 10% off, cap at 50 baht, minimum order 100 baht, usable 100 times.
 -- INSERT INTO coupons (code, discount_type, discount_value, min_order_amount, max_discount_amount, usage_limit)
 -- VALUES ('WELCOME10', 'PERCENT', 10, 100, 50, 100);
