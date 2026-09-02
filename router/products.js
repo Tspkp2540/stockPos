@@ -2,6 +2,10 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const { requireRoles } = require('../middleware/auth');
+const configuredLowStockThreshold = Number(process.env.MENU_LOW_STOCK_THRESHOLD);
+const menuLowStockThreshold = Number.isInteger(configuredLowStockThreshold) && configuredLowStockThreshold > 0
+  ? configuredLowStockThreshold
+  : 5;
 
 const normalizeModifiers = (modifiers = []) => {
   if (!Array.isArray(modifiers)) throw new Error('Modifiers must be a list');
@@ -139,7 +143,20 @@ router.get('/', async (req, res) => {
       ORDER BY p.id ASC;
     `;
     const result = await pool.query(query);
-    res.json({ success: true, data: result.rows });
+    const products = result.rows.map((product) => {
+      const availableQuantity = Number(product.available_quantity);
+      const isLowStock = product.is_available === true
+        && product.availability_reason === 'AVAILABLE'
+        && Number.isFinite(availableQuantity)
+        && availableQuantity > 0
+        && availableQuantity <= menuLowStockThreshold;
+      return {
+        ...product,
+        low_stock_threshold: menuLowStockThreshold,
+        is_low_stock: isLowStock,
+      };
+    });
+    res.json({ success: true, data: products });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
