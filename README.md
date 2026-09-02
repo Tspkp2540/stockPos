@@ -118,7 +118,7 @@ Authorization: Bearer <token>
 | สต็อก | `GET/POST/PUT/DELETE /api/inventory`, `POST /api/inventory/restock` | Admin |
 | เมนู/สูตร | `GET/POST/PUT/DELETE /api/products`, `PATCH /api/products/:id/availability` | Admin/Staff อ่าน, Admin จัดการ/ปิดขาย |
 | การเงิน | `GET /api/financial-summary`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
-| คูปอง | `POST /api/coupons/validate`, `GET/POST /api/coupons` | Staff/Admin, Admin |
+| คูปอง | `POST /api/coupons/validate`, `GET/POST/PUT /api/coupons` | Staff/Admin, Admin |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
 | ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/lots`, `GET /api/inventory/movements` | Admin |
 | ใบสั่งซื้อ | `GET/POST /api/purchase-orders`, `PATCH /api/purchase-orders/:id/status`, `POST /api/purchase-orders/:id/receive` | Admin |

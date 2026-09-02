@@ -514,6 +514,47 @@ app.post('/api/coupons', requireAuth, requireRoles('ADMIN'), async (req, res) =>
   }
 });
 
+app.put('/api/coupons/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const couponId = Number(req.params.id);
+  const code = normalizeCouponCode(req.body?.code);
+  const discountType = String(req.body?.discount_type || '').toUpperCase();
+  const discountValue = Number(req.body?.discount_value);
+  const minOrderAmount = Math.max(0, Number(req.body?.min_order_amount) || 0);
+  const hasMaxDiscount = req.body?.max_discount_amount !== undefined && req.body?.max_discount_amount !== null && req.body?.max_discount_amount !== '';
+  const hasUsageLimit = req.body?.usage_limit !== undefined && req.body?.usage_limit !== null && req.body?.usage_limit !== '';
+  const maxDiscountAmount = hasMaxDiscount ? Number(req.body.max_discount_amount) : null;
+  const usageLimit = hasUsageLimit ? Number(req.body.usage_limit) : null;
+  const validFrom = req.body?.valid_from || null;
+  const validUntil = req.body?.valid_until || null;
+  const isActive = typeof req.body?.is_active === 'boolean' ? req.body.is_active : true;
+
+  if (!Number.isInteger(couponId) || couponId <= 0 || !/^[A-Z0-9_-]{3,64}$/.test(code) || !['AMOUNT', 'PERCENT'].includes(discountType) || !Number.isFinite(discountValue) || discountValue <= 0) {
+    return res.status(400).json({ success: false, error: 'Coupon data is invalid' });
+  }
+  if (discountType === 'PERCENT' && discountValue > 100) return res.status(400).json({ success: false, error: 'Percent discount cannot exceed 100' });
+  if ((maxDiscountAmount !== null && (!Number.isFinite(maxDiscountAmount) || maxDiscountAmount <= 0)) ||
+      (usageLimit !== null && (!Number.isInteger(usageLimit) || usageLimit <= 0))) {
+    return res.status(400).json({ success: false, error: 'Coupon limit data is invalid' });
+  }
+  if (validFrom && validUntil && new Date(validFrom) > new Date(validUntil)) return res.status(400).json({ success: false, error: 'Coupon date range is invalid' });
+
+  try {
+    const result = await pool.query(
+      `UPDATE coupons
+       SET code = $1, discount_type = $2, discount_value = $3, min_order_amount = $4,
+           max_discount_amount = $5, usage_limit = $6, valid_from = $7, valid_until = $8, is_active = $9
+       WHERE id = $10
+       RETURNING *`,
+      [code, discountType, discountValue, minOrderAmount, maxDiscountAmount, usageLimit, validFrom, validUntil, isActive, couponId]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Coupon not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'Coupon code already exists' });
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Register routers after middleware
 app.use('/api/inventory', requireAuth, requireRoles('ADMIN'), inventoryRouter);
 app.use('/api/purchase-orders', requireAuth, requireRoles('ADMIN'), purchaseOrdersRouter);
