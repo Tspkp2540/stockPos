@@ -107,6 +107,8 @@ const startServer = async () => {
       )
     `);
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id)');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ');
+    await client.query('ALTER TABLE IF EXISTS orders ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20)');
     await client.query('CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(phone) WHERE phone IS NOT NULL');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_name VARCHAR(120)');
@@ -550,7 +552,7 @@ io.on('connection', (socket) => {
 // API ROUTES
 // ----------------------------------------------------
 
-// Dashboard สาธารณะ: แสดงออเดอร์ล่าสุดทั้งหมด หรือกรองด้วยเบอร์โทรได้
+// Dashboard สาธารณะ: แสดงเฉพาะคิวของวันนี้ หรือกรองด้วยเบอร์โทรได้
 app.post('/api/public/orders/lookup', async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (phone && !isValidPhone(phone)) {
@@ -580,6 +582,7 @@ app.post('/api/public/orders/lookup', async (req, res) => {
        LEFT JOIN order_items oi ON oi.order_id = o.id
        LEFT JOIN products p ON p.id = oi.product_id
        WHERE ($1::varchar IS NULL OR o.customer_phone = $1)
+         AND (o.created_at AT TIME ZONE 'Asia/Bangkok')::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
        GROUP BY o.id, c.name
        ORDER BY o.created_at DESC
        LIMIT 50`,
