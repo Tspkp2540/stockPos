@@ -12,7 +12,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - บันทึกชื่อเล่น/เบอร์โทรของผู้ซื้อแบบไม่บังคับ เพื่อค้นหาออเดอร์ได้
 - หน้า public lookup ให้ลูกค้าหรือผู้ใช้ทั่วไปติดตามเฉพาะคิวออเดอร์ของวันปัจจุบัน หรือกรองด้วยเบอร์โทร
 - จัดการวัตถุดิบ, รับของเข้าสต็อก, เมนูสินค้า, สูตร BOM, ตัวเลือกเมนู (Modifier) และช่องทางขาย
-- บันทึก/แก้ไข/ลบค่าใช้จ่าย และสรุปการเงินตามวันที่
+- บันทึก/แก้ไข/ลบค่าใช้จ่าย สรุปการเงินตามวันที่ และรายงานยอดขายแยกตามช่องทาง/วิธีชำระเงิน
 - ส่วนลดหน้าร้านและคูปอง โดยเก็บยอดก่อนลด ยอดลดแต่ละประเภท และยอดสุทธิในออเดอร์
 - รับชำระด้วยเงินสด, QR, โอน, บัตร หรืออื่น ๆ พร้อมยอดรับและเงินทอน
 - เปิด/ปิดกะเงินสดแยกตามผู้ใช้งาน และคำนวณยอดคาดการณ์กับยอดต่างเมื่อปิดกะ
@@ -117,7 +117,7 @@ Authorization: Bearer <token>
 | ออเดอร์ | `GET/POST /api/orders`, `PUT /api/orders/:id`, `PUT /api/orders/:id/status`, `PUT /api/orders/:id/cancel`, `DELETE /api/orders/:id` | ตามสิทธิ์ |
 | สต็อก | `GET/POST/PUT/DELETE /api/inventory`, `POST /api/inventory/restock` | Admin |
 | เมนู/สูตร | `GET/POST/PUT/DELETE /api/products`, `PATCH /api/products/:id/availability` | Admin/Staff อ่าน, Admin จัดการ/ปิดขาย |
-| การเงิน | `GET /api/financial-summary`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
+| การเงิน | `GET /api/financial-summary`, `GET /api/sales-breakdown`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
 | คูปอง | `POST /api/coupons/validate`, `GET/POST/PUT /api/coupons` | Staff/Admin, Admin |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
 | ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/lots`, `GET /api/inventory/movements` | Admin |

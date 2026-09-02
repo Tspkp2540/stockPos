@@ -850,10 +850,54 @@ app.get('/api/financial-summary', requireAuth, requireRoles('ADMIN'), async (req
         (SELECT COALESCE(SUM(amount), 0) FROM expenses
          WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)) AS total_expenses
       FROM orders
-      WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date);
+      WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)
+        AND status <> 'CANCELLED';
     `;
     const result = await pool.query(query, [recordDate]);
     res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 📊 GET /api/sales-breakdown?date=YYYY-MM-DD - สรุปยอดตามช่องทางและวิธีชำระเงิน
+app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const recordDate = selectedRecordDate(req.query?.date);
+  const dateFilter = "DATE(o.created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)";
+  try {
+    const [channelResult, paymentResult] = await Promise.all([
+      pool.query(
+        `SELECT COALESCE(c.name, 'ไม่ระบุช่องทาง') AS channel_name,
+                COUNT(o.id)::int AS order_count,
+                COALESCE(SUM(o.gross_amount), 0) AS gross_amount,
+                COALESCE(SUM(o.net_revenue), 0) AS net_revenue
+         FROM orders o
+         LEFT JOIN channels c ON c.id = o.channel_id
+         WHERE ${dateFilter} AND o.status <> 'CANCELLED'
+         GROUP BY c.id, c.name
+         ORDER BY gross_amount DESC, channel_name ASC`,
+        [recordDate]
+      ),
+      pool.query(
+        `SELECT COALESCE(op.payment_method, 'OTHER') AS payment_method,
+                COUNT(o.id)::int AS order_count,
+                COALESCE(SUM(COALESCE(op.paid_amount, o.gross_amount)), 0) AS payment_amount,
+                COALESCE(SUM(COALESCE(op.change_amount, 0)), 0) AS change_amount
+         FROM orders o
+         LEFT JOIN order_payments op ON op.order_id = o.id AND op.status = 'PAID'
+         WHERE ${dateFilter} AND o.status <> 'CANCELLED'
+         GROUP BY COALESCE(op.payment_method, 'OTHER')
+         ORDER BY payment_amount DESC, payment_method ASC`,
+        [recordDate]
+      ),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        channels: channelResult.rows,
+        payments: paymentResult.rows,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
