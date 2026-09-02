@@ -677,14 +677,16 @@ app.get('/api/shifts/current', requireAuth, requireRoles('ADMIN', 'STAFF'), asyn
 app.get('/api/shifts', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT cs.*, opened_user.full_name AS opened_by_name, COALESCE(SUM(op.paid_amount) FILTER (
+      `SELECT cs.*, opened_user.full_name AS opened_by_name,
+        closed_user.full_name AS closed_by_name, COALESCE(SUM(op.paid_amount) FILTER (
         WHERE op.payment_method = 'CASH' AND op.status = 'PAID'
       ), 0) AS cash_sales
        FROM cash_shifts cs
        LEFT JOIN order_payments op ON op.cash_shift_id = cs.id
        LEFT JOIN users opened_user ON opened_user.id = cs.opened_by
+       LEFT JOIN users closed_user ON closed_user.id = cs.closed_by
        WHERE cs.status IN ('OPEN', 'CLOSED')
-       GROUP BY cs.id, opened_user.full_name
+       GROUP BY cs.id, opened_user.full_name, closed_user.full_name
        ORDER BY cs.opened_at DESC
        LIMIT 50`
     );
