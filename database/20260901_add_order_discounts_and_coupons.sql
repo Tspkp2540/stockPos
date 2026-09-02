@@ -1,6 +1,9 @@
 -- Run this once on an existing PostgreSQL database when migrations are managed manually.
 -- The backend also applies the same non-destructive schema updates on startup.
 
+-- Manual temporary sold-out state. Automatic availability is calculated from unexpired lots.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS is_sold_out BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE TABLE IF NOT EXISTS coupons (
   id BIGSERIAL PRIMARY KEY,
   code VARCHAR(64) NOT NULL UNIQUE,

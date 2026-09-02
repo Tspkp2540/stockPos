@@ -112,6 +112,7 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_nickname VARCHAR(80)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS queue_no INTEGER');
+    await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS is_sold_out BOOLEAN NOT NULL DEFAULT FALSE');
     await client.query(`
       CREATE TABLE IF NOT EXISTS coupons (
         id BIGSERIAL PRIMARY KEY,
@@ -920,6 +921,13 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
       if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
         throw requestError('Order item quantity and price are invalid');
       }
+      const productResult = await client.query(
+        'SELECT id, name, is_sold_out FROM products WHERE id = $1 FOR KEY SHARE',
+        [item.product_id]
+      );
+      const product = productResult.rows[0];
+      if (!product) throw requestError('Product not found', 404);
+      if (product.is_sold_out) throw requestError(`${product.name} is temporarily unavailable`, 409);
       const selectedModifiers = await resolveItemModifiers(client, item.product_id, item.modifiers);
       const modifierAdjustment = selectedModifiers.reduce(
         (sum, modifier) => sum + Number(modifier.price_adjustment || 0),

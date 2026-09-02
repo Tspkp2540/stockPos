@@ -84,7 +84,54 @@ router.get('/', async (req, res) => {
           )
           FROM product_modifier_groups mg
           WHERE mg.product_id = p.id
-        ), '[]'::json) AS modifier_groups
+        ), '[]'::json) AS modifier_groups,
+        CASE
+          WHEN p.is_sold_out THEN FALSE
+          WHEN NOT EXISTS (SELECT 1 FROM recipes tracked_recipe WHERE tracked_recipe.product_id = p.id) THEN TRUE
+          WHEN EXISTS (
+            SELECT 1
+            FROM recipes availability_recipe
+            WHERE availability_recipe.product_id = p.id
+              AND availability_recipe.quantity_used > COALESCE((
+                SELECT SUM(inventory_lot.remaining_quantity)
+                FROM inventory_lots inventory_lot
+                WHERE inventory_lot.ingredient_id = availability_recipe.ingredient_id
+                  AND inventory_lot.remaining_quantity > 0
+                  AND (inventory_lot.expiry_date IS NULL OR inventory_lot.expiry_date >= CURRENT_DATE)
+              ), 0)
+          ) THEN FALSE
+          ELSE TRUE
+        END AS is_available,
+        CASE
+          WHEN p.is_sold_out THEN 'MANUALLY_SOLD_OUT'
+          WHEN NOT EXISTS (SELECT 1 FROM recipes tracked_recipe WHERE tracked_recipe.product_id = p.id) THEN 'NOT_TRACKED'
+          WHEN EXISTS (
+            SELECT 1
+            FROM recipes availability_recipe
+            WHERE availability_recipe.product_id = p.id
+              AND availability_recipe.quantity_used > COALESCE((
+                SELECT SUM(inventory_lot.remaining_quantity)
+                FROM inventory_lots inventory_lot
+                WHERE inventory_lot.ingredient_id = availability_recipe.ingredient_id
+                  AND inventory_lot.remaining_quantity > 0
+                  AND (inventory_lot.expiry_date IS NULL OR inventory_lot.expiry_date >= CURRENT_DATE)
+              ), 0)
+          ) THEN 'INSUFFICIENT_STOCK'
+          ELSE 'AVAILABLE'
+        END AS availability_reason,
+        (
+          SELECT MIN(FLOOR(
+            COALESCE((
+              SELECT SUM(inventory_lot.remaining_quantity)
+              FROM inventory_lots inventory_lot
+              WHERE inventory_lot.ingredient_id = availability_recipe.ingredient_id
+                AND inventory_lot.remaining_quantity > 0
+                AND (inventory_lot.expiry_date IS NULL OR inventory_lot.expiry_date >= CURRENT_DATE)
+            ), 0) / NULLIF(availability_recipe.quantity_used, 0)
+          ))
+          FROM recipes availability_recipe
+          WHERE availability_recipe.product_id = p.id
+        ) AS available_quantity
       FROM products p
       LEFT JOIN recipes r ON p.id = r.product_id
       LEFT JOIN ingredients i ON r.ingredient_id = i.id
@@ -99,6 +146,23 @@ router.get('/', async (req, res) => {
 });
 
 router.use(requireRoles('ADMIN'));
+
+// PATCH /api/products/:id/availability - ปิด/เปิดขายเมนูชั่วคราว
+router.patch('/:id/availability', async (req, res) => {
+  if (typeof req.body?.is_sold_out !== 'boolean') {
+    return res.status(400).json({ success: false, error: 'is_sold_out must be true or false' });
+  }
+  try {
+    const result = await pool.query(
+      'UPDATE products SET is_sold_out = $1 WHERE id = $2 RETURNING *',
+      [req.body.is_sold_out, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Product not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // 📌 POST /api/products - เพิ่มสินค้าใหม่
 router.post('/', async (req, res) => {

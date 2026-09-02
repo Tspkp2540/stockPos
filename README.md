@@ -17,6 +17,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - รับชำระด้วยเงินสด, QR, โอน, บัตร หรืออื่น ๆ พร้อมยอดรับและเงินทอน
 - เปิด/ปิดกะเงินสดแยกตามผู้ใช้งาน และคำนวณยอดคาดการณ์กับยอดต่างเมื่อปิดกะ
 - จัดการผู้ขายและใบรับวัตถุดิบเข้า รองรับหลายรายการต่อใบ ปรับต้นทุนเฉลี่ย และเก็บประวัติการเคลื่อนไหวสต็อก
+- สถานะเมนูพร้อมขายจากสูตร BOM และล็อตวัตถุดิบที่ยังไม่หมดอายุ พร้อมปิดขายชั่วคราวรายเมนูโดย Admin
 - ส่งเหตุการณ์แบบ real-time ผ่าน Socket.IO ให้หน้า POS, คิว และศูนย์ปฏิบัติการอัปเดตทันที
 
 ## สิทธิ์การใช้งาน
@@ -60,6 +61,8 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
 `suppliers` เก็บข้อมูลผู้ขาย ส่วน `stock_receipts` และ `stock_receipt_items` เก็บใบรับของ ต้นทุนจริง และรายการที่รับเข้า เมื่อสร้างใบรับผ่าน `POST /api/inventory/receipts` ระบบจะ lock วัตถุดิบ, เพิ่มจำนวนคงเหลือ, คำนวณต้นทุนเฉลี่ยถ่วงน้ำหนัก และสร้าง `inventory_movements` ประเภท `PURCHASE` ภายใน transaction เดียวกัน จึงตรวจสอบย้อนกลับได้ว่าของเข้ามาจากใครและต้นทุนเท่าใด
 
 `inventory_lots` เก็บเลขล็อต วันรับเข้า วันหมดอายุ จำนวนเริ่มต้น และจำนวนคงเหลือของแต่ละล็อต ทุกการขายจะจัดสรรวัตถุดิบจากล็อตที่วันหมดอายุเร็วที่สุดก่อน (FEFO) ผ่าน `order_item_lot_allocations` และไม่ใช้ล็อตที่หมดอายุ การแก้ไขหรือลบออเดอร์ และการยกเลิก จะคืนปริมาณให้ล็อตเดิมเพื่อให้ยอดย้อนหลังถูกต้อง
+
+`GET /api/products` คำนวณ `is_available`, `availability_reason` และ `available_quantity` ของทุกเมนูจากสูตร BOM และยอดรวมของล็อตที่ยังไม่หมดอายุ เมนูที่วัตถุดิบไม่เพียงพอจะขายไม่ได้จาก POS ส่วน Admin สามารถเรียก `PATCH /api/products/:id/availability` ด้วย `{ "is_sold_out": true }` เพื่อปิดขายชั่วคราว หรือส่ง `false` เพื่อเปิดให้ระบบคำนวณสถานะตามสต็อกอีกครั้ง การสร้างออเดอร์ตรวจสถานะปิดขายซ้ำใน backend เพื่อป้องกันการข้ามหน้าจอ POS
 
 `POST /api/inventory/adjustments` ใช้สำหรับตรวจนับยอดจริง (`STOCK_COUNT`) หรือบันทึกของเสีย (`WASTE`) โดยบันทึกส่วนต่างเป็น `inventory_movements` ประเภท `ADJUSTMENT` ยอดคงเหลือจะไม่สามารถติดลบ และของเสียต้องระบุเหตุผลก่อนบันทึก
 
@@ -110,7 +113,7 @@ Authorization: Bearer <token>
 | ติดตามออเดอร์ | `POST /api/public/orders/lookup` | สาธารณะ |
 | ออเดอร์ | `GET/POST /api/orders`, `PUT /api/orders/:id`, `PUT /api/orders/:id/status`, `PUT /api/orders/:id/cancel`, `DELETE /api/orders/:id` | ตามสิทธิ์ |
 | สต็อก | `GET/POST/PUT/DELETE /api/inventory`, `POST /api/inventory/restock` | Admin |
-| เมนู/สูตร | `GET/POST/PUT/DELETE /api/products` | Admin/Staff ตามการดำเนินการ |
+| เมนู/สูตร | `GET/POST/PUT/DELETE /api/products`, `PATCH /api/products/:id/availability` | Admin/Staff อ่าน, Admin จัดการ/ปิดขาย |
 | การเงิน | `GET /api/financial-summary`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
 | คูปอง | `POST /api/coupons/validate`, `GET/POST /api/coupons` | Staff/Admin, Admin |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
