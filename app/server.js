@@ -26,6 +26,25 @@ const isValidPhone = (value) => /^\d{9,15}$/.test(value);
 const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase() });
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+const LOYALTY_BAHT_PER_POINT = 0.1;
+const LOYALTY_SPEND_PER_POINT = 25;
+const LOYALTY_MAX_REDEEM_RATIO = 0.5;
+const loyaltyPointsForAmount = (amount) => Math.floor(Math.max(0, Number(amount) || 0) / LOYALTY_SPEND_PER_POINT);
+const loyaltyDiscountForPoints = (points) => Number((Math.max(0, Number(points) || 0) * LOYALTY_BAHT_PER_POINT).toFixed(2));
+const loyaltyRules = () => ({
+  spend_per_point: LOYALTY_SPEND_PER_POINT,
+  baht_per_point: LOYALTY_BAHT_PER_POINT,
+  max_redeem_percent: LOYALTY_MAX_REDEEM_RATIO * 100,
+});
+const loyaltyAccountPayload = (account) => account ? ({
+  id: Number(account.id),
+  customer_phone: account.customer_phone,
+  customer_name: account.customer_name || '',
+  points_balance: Number(account.points_balance || 0),
+  lifetime_points: Number(account.lifetime_points || 0),
+  lifetime_spend: Number(account.lifetime_spend || 0),
+  updated_at: account.updated_at,
+}) : null;
 const paymentMethods = new Set(['CASH', 'QR', 'TRANSFER', 'CARD', 'OTHER']);
 const normalizePaymentMethod = (value) => {
   const method = String(value || 'OTHER').trim().toUpperCase();
@@ -136,6 +155,36 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_nickname VARCHAR(80)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS queue_no INTEGER');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS loyalty_accounts (
+        id BIGSERIAL PRIMARY KEY,
+        customer_phone VARCHAR(20) NOT NULL UNIQUE,
+        customer_name VARCHAR(120) NOT NULL DEFAULT '',
+        points_balance INTEGER NOT NULL DEFAULT 0,
+        lifetime_points INTEGER NOT NULL DEFAULT 0,
+        lifetime_spend NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS loyalty_transactions (
+        id BIGSERIAL PRIMARY KEY,
+        loyalty_account_id BIGINT NOT NULL REFERENCES loyalty_accounts(id) ON DELETE CASCADE,
+        order_id BIGINT REFERENCES orders(id) ON DELETE SET NULL,
+        transaction_type VARCHAR(32) NOT NULL CHECK (transaction_type IN ('EARN', 'REDEEM', 'CANCEL_EARN_REVERSAL', 'CANCEL_REDEEM_REVERSAL')),
+        points_delta INTEGER NOT NULL,
+        amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS loyalty_account_id BIGINT REFERENCES loyalty_accounts(id) ON DELETE SET NULL');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS loyalty_points_earned INTEGER NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS loyalty_points_redeemed INTEGER NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS loyalty_discount_amount NUMERIC(12, 2) NOT NULL DEFAULT 0');
+    await client.query('CREATE INDEX IF NOT EXISTS loyalty_transactions_account_created_idx ON loyalty_transactions(loyalty_account_id, created_at DESC)');
+    await client.query('CREATE INDEX IF NOT EXISTS orders_loyalty_account_idx ON orders(loyalty_account_id)');
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS is_sold_out BOOLEAN NOT NULL DEFAULT FALSE');
     await client.query(`
       CREATE TABLE IF NOT EXISTS coupons (
@@ -443,6 +492,37 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     const result = await pool.query('SELECT id, username, full_name, phone, role FROM users WHERE id = $1', [req.user.sub]);
     if (!result.rows.length) return res.status(401).json({ success: false, error: 'Session is no longer valid' });
     res.json({ success: true, data: publicUser(result.rows[0]) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/loyalty/me', requireAuth, requireRoles('USER'), async (req, res) => {
+  try {
+    const userResult = await pool.query('SELECT phone FROM users WHERE id = $1', [req.user.sub]);
+    const phone = userResult.rows[0]?.phone || '';
+    if (!phone) return res.json({ success: true, data: { account: null, rules: loyaltyRules() } });
+    const result = await pool.query(
+      `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at
+       FROM loyalty_accounts WHERE customer_phone = $1`,
+      [phone]
+    );
+    res.json({ success: true, data: { account: loyaltyAccountPayload(result.rows[0]), rules: loyaltyRules() } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  if (!isValidPhone(phone)) return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
+  try {
+    const result = await pool.query(
+      `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at
+       FROM loyalty_accounts WHERE customer_phone = $1`,
+      [phone]
+    );
+    res.json({ success: true, data: { account: loyaltyAccountPayload(result.rows[0]), rules: loyaltyRules() } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -834,7 +914,8 @@ app.get('/api/orders', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT o.id, o.order_no, o.queue_no, o.customer_name, o.customer_nickname, o.customer_phone, o.channel_id, c.name AS channel_name, o.status,
-              o.subtotal_amount, o.discount_amount, o.manual_discount_amount, o.coupon_discount_amount,
+              o.subtotal_amount, o.discount_amount, o.manual_discount_amount, o.coupon_discount_amount, o.loyalty_discount_amount,
+              o.loyalty_points_earned, o.loyalty_points_redeemed,
               o.coupon_code, o.coupon_id, o.gross_amount, o.gp_amount, o.total_cogs, o.net_revenue, o.net_profit, o.created_at,
               COALESCE((
                 SELECT JSON_BUILD_OBJECT(
@@ -1053,6 +1134,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     Number(req.body?.manual_discount_amount ?? req.body?.discount_amount) || 0
   );
   const requestedCouponCode = normalizeCouponCode(req.body?.coupon_code);
+  const requestedLoyaltyPoints = Number(req.body?.loyalty_points_redeemed || 0);
   let paymentMethod;
   try {
     paymentMethod = normalizePaymentMethod(req.body?.payment_method);
@@ -1067,6 +1149,9 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
   }
   if (customerPhone && !isValidPhone(customerPhone)) {
     return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
+  }
+  if (!Number.isInteger(requestedLoyaltyPoints) || requestedLoyaltyPoints < 0) {
+    return res.status(400).json({ success: false, error: 'Loyalty points must be a non-negative whole number' });
   }
 
   const client = await pool.connect();
@@ -1191,8 +1276,43 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
       await client.query('UPDATE coupons SET used_count = used_count + 1 WHERE id = $1', [couponId]);
     }
 
-    const discountAmount = manualDiscountAmount + couponDiscountAmount;
+    const loyaltyBaseAmount = Math.max(0, couponBaseAmount - couponDiscountAmount);
+    let loyaltyAccount = null;
+    let loyaltyPointsRedeemed = 0;
+    let loyaltyDiscountAmount = 0;
+    if (customerPhone) {
+      const accountResult = await client.query(
+        `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at
+         FROM loyalty_accounts WHERE customer_phone = $1 FOR UPDATE`,
+        [customerPhone]
+      );
+      if (accountResult.rows.length) {
+        loyaltyAccount = accountResult.rows[0];
+      } else {
+        const insertedAccount = await client.query(
+          `INSERT INTO loyalty_accounts (customer_phone, customer_name)
+           VALUES ($1, $2)
+           ON CONFLICT (customer_phone) DO UPDATE SET customer_phone = EXCLUDED.customer_phone
+           RETURNING id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at`,
+          [customerPhone, customerName]
+        );
+        loyaltyAccount = insertedAccount.rows[0];
+      }
+      if (requestedLoyaltyPoints > 0) {
+        const availablePoints = Math.max(0, Number(loyaltyAccount.points_balance || 0));
+        const maxRedeemPoints = Math.floor((loyaltyBaseAmount * LOYALTY_MAX_REDEEM_RATIO) / LOYALTY_BAHT_PER_POINT);
+        if (requestedLoyaltyPoints > availablePoints) throw requestError('Customer does not have enough loyalty points', 409);
+        if (requestedLoyaltyPoints > maxRedeemPoints) throw requestError(`This order can redeem at most ${maxRedeemPoints} points`, 400);
+        loyaltyPointsRedeemed = requestedLoyaltyPoints;
+        loyaltyDiscountAmount = loyaltyDiscountForPoints(loyaltyPointsRedeemed);
+      }
+    } else if (requestedLoyaltyPoints > 0) {
+      throw requestError('A customer phone number is required to redeem loyalty points');
+    }
+
+    const discountAmount = manualDiscountAmount + couponDiscountAmount + loyaltyDiscountAmount;
     const grossAmount = Math.max(0, subtotalAmount - discountAmount);
+    const loyaltyPointsEarned = loyaltyAccount ? loyaltyPointsForAmount(grossAmount) : 0;
 
     const paidAmount = grossAmount;
     let amountReceived = paidAmount;
@@ -1230,8 +1350,10 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
       `UPDATE orders
        SET subtotal_amount = $1, manual_discount_amount = $2, coupon_discount_amount = $3,
            discount_amount = $4, coupon_code = $5, coupon_id = $6,
-           gross_amount = $7, gp_amount = $8, net_revenue = $9, total_cogs = $10, net_profit = $11
-       WHERE id = $12 RETURNING *`,
+           gross_amount = $7, gp_amount = $8, net_revenue = $9, total_cogs = $10, net_profit = $11,
+           loyalty_account_id = $12, loyalty_points_earned = $13, loyalty_points_redeemed = $14,
+           loyalty_discount_amount = $15
+       WHERE id = $16 RETURNING *`,
       [
         subtotalAmount,
         manualDiscountAmount,
@@ -1244,6 +1366,10 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
         netRevenue,
         totalCogs,
         netProfit,
+        loyaltyAccount?.id || null,
+        loyaltyPointsEarned,
+        loyaltyPointsRedeemed,
+        loyaltyDiscountAmount,
         orderId,
       ]
     );
@@ -1254,6 +1380,33 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [orderId, cashShiftId, req.user.sub, paymentMethod, paidAmount, amountReceived, changeAmount]
     );
+
+    if (loyaltyAccount) {
+      await client.query(
+        `UPDATE loyalty_accounts
+         SET points_balance = points_balance - $1 + $2,
+             lifetime_points = lifetime_points + $2,
+             lifetime_spend = lifetime_spend + $3,
+             customer_name = COALESCE(NULLIF($4, ''), customer_name),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $5`,
+        [loyaltyPointsRedeemed, loyaltyPointsEarned, grossAmount, customerName, loyaltyAccount.id]
+      );
+      if (loyaltyPointsRedeemed) {
+        await client.query(
+          `INSERT INTO loyalty_transactions (loyalty_account_id, order_id, transaction_type, points_delta, amount, note)
+           VALUES ($1, $2, 'REDEEM', $3, $4, 'Redeemed at checkout')`,
+          [loyaltyAccount.id, orderId, -loyaltyPointsRedeemed, loyaltyDiscountAmount]
+        );
+      }
+      if (loyaltyPointsEarned) {
+        await client.query(
+          `INSERT INTO loyalty_transactions (loyalty_account_id, order_id, transaction_type, points_delta, amount, note)
+           VALUES ($1, $2, 'EARN', $3, $4, 'Earned from order')`,
+          [loyaltyAccount.id, orderId, loyaltyPointsEarned, grossAmount]
+        );
+      }
+    }
 
     // ยืนยันการทำ Transaction ลง Database
     await client.query('COMMIT');
@@ -1307,11 +1460,16 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
   try {
     await client.query('BEGIN');
     const orderResult = await client.query(
-      'SELECT id, status, manual_discount_amount, coupon_discount_amount FROM orders WHERE id = $1 FOR UPDATE',
+      `SELECT id, status, manual_discount_amount, coupon_discount_amount,
+              loyalty_points_earned, loyalty_points_redeemed, loyalty_discount_amount
+       FROM orders WHERE id = $1 FOR UPDATE`,
       [id]
     );
     if (!orderResult.rows.length) throw new Error('Order not found');
     if (orderResult.rows[0].status === 'CANCELLED') throw new Error('Cancelled sales records cannot be edited');
+    if (Number(orderResult.rows[0].loyalty_points_earned || 0) || Number(orderResult.rows[0].loyalty_points_redeemed || 0)) {
+      throw new Error('Loyalty-linked orders cannot be edited. Cancel and create a replacement order instead.');
+    }
 
     const channelResult = await client.query('SELECT gp_percent FROM channels WHERE id = $1', [channel_id]);
     if (!channelResult.rows.length) throw new Error('Invalid channel_id');
@@ -1445,7 +1603,11 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const orderResult = await client.query('SELECT id, status FROM orders WHERE id = $1 FOR UPDATE', [id]);
+    const orderResult = await client.query(
+      `SELECT id, status, loyalty_account_id, loyalty_points_earned, loyalty_points_redeemed
+       FROM orders WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
     if (!orderResult.rows.length) throw new Error('Order not found');
     if (orderResult.rows[0].status !== 'CANCELLED') {
       const previousIngredients = await client.query(
@@ -1477,7 +1639,21 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
           });
         }
       }
+      const loyaltyOrder = orderResult.rows[0];
+      if (loyaltyOrder.loyalty_account_id) {
+        await client.query(
+          `UPDATE loyalty_accounts
+           SET points_balance = points_balance + $1 - $2, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $3`,
+          [
+            Number(loyaltyOrder.loyalty_points_redeemed || 0),
+            Number(loyaltyOrder.loyalty_points_earned || 0),
+            loyaltyOrder.loyalty_account_id,
+          ]
+        );
+      }
     }
+    await client.query('DELETE FROM loyalty_transactions WHERE order_id = $1', [id]);
     await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
     await client.query('DELETE FROM orders WHERE id = $1', [id]);
     await client.query('COMMIT');

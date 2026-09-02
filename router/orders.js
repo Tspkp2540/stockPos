@@ -126,7 +126,12 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
     await client.query('BEGIN');
 
     // 1. ตรวจสอบสถานะออเดอร์
-    const orderRes = await client.query('SELECT status FROM orders WHERE id = $1', [id]);
+    const orderRes = await client.query(
+      `SELECT id, status, loyalty_account_id, loyalty_points_earned, loyalty_points_redeemed,
+              loyalty_discount_amount
+       FROM orders WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
     if (orderRes.rows.length === 0) {
       throw new Error('Order not found');
     }
@@ -181,6 +186,31 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
        WHERE order_id = $1 AND status = 'PAID'`,
       [id]
     );
+    const loyaltyOrder = orderRes.rows[0];
+    if (loyaltyOrder.loyalty_account_id) {
+      const earnedPoints = Number(loyaltyOrder.loyalty_points_earned || 0);
+      const redeemedPoints = Number(loyaltyOrder.loyalty_points_redeemed || 0);
+      await client.query(
+        `UPDATE loyalty_accounts
+         SET points_balance = points_balance + $1 - $2, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
+        [redeemedPoints, earnedPoints, loyaltyOrder.loyalty_account_id]
+      );
+      if (earnedPoints) {
+        await client.query(
+          `INSERT INTO loyalty_transactions (loyalty_account_id, order_id, transaction_type, points_delta, amount, note)
+           VALUES ($1, $2, 'CANCEL_EARN_REVERSAL', $3, 0, 'Points reversed after order cancellation')`,
+          [loyaltyOrder.loyalty_account_id, id, -earnedPoints]
+        );
+      }
+      if (redeemedPoints) {
+        await client.query(
+          `INSERT INTO loyalty_transactions (loyalty_account_id, order_id, transaction_type, points_delta, amount, note)
+           VALUES ($1, $2, 'CANCEL_REDEEM_REVERSAL', $3, $4, 'Redeemed points returned after order cancellation')`,
+          [loyaltyOrder.loyalty_account_id, id, redeemedPoints, Number(loyaltyOrder.loyalty_discount_amount || 0)]
+        );
+      }
+    }
 
     await client.query('COMMIT');
 
