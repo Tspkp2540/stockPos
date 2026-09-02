@@ -106,6 +106,27 @@ const startServer = async () => {
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS channels (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(120) NOT NULL UNIQUE,
+        gp_percent NUMERIC(5, 2) NOT NULL DEFAULT 0 CHECK (gp_percent >= 0 AND gp_percent <= 100),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query('ALTER TABLE channels ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE');
+    await client.query('ALTER TABLE channels ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP');
+    await client.query('ALTER TABLE channels ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP');
+    for (const [name, feePercent] of [['Front Store', 0], ['GrabFood', 30], ['LINE MAN', 30]]) {
+      await client.query(
+        `INSERT INTO channels (name, gp_percent)
+         SELECT $1, $2
+         WHERE NOT EXISTS (SELECT 1 FROM channels WHERE LOWER(name) = LOWER($1))`,
+        [name, feePercent]
+      );
+    }
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ');
     await client.query('ALTER TABLE IF EXISTS orders ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP');
@@ -640,13 +661,61 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date() });
 });
 
-// 📌 GET /api/channels - ดึงรายชื่อช่องทางขาย (% GP)
+// 📌 GET /api/channels - ดึงรายชื่อช่องทางขาย
 app.get('/api/channels', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM channels ORDER BY id ASC');
+    const result = await pool.query(
+      req.user.role === 'ADMIN'
+        ? 'SELECT * FROM channels ORDER BY is_active DESC, id ASC'
+        : 'SELECT * FROM channels WHERE is_active = TRUE ORDER BY id ASC'
+    );
     res.json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+const normalizeChannelPayload = (body = {}) => {
+  const name = String(body.name || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+  const gpPercent = Number(body.gp_percent ?? 0);
+  const isActive = body.is_active !== false;
+  if (name.length < 2) throw requestError('Channel name must contain at least 2 characters');
+  if (!Number.isFinite(gpPercent) || gpPercent < 0 || gpPercent > 100) {
+    throw requestError('Channel fee percentage must be between 0 and 100');
+  }
+  return { name, gpPercent, isActive };
+};
+
+app.post('/api/channels', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const { name, gpPercent, isActive } = normalizeChannelPayload(req.body);
+    const result = await pool.query(
+      `INSERT INTO channels (name, gp_percent, is_active)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [name, gpPercent, isActive]
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'Channel name already exists' });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/channels/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const { name, gpPercent, isActive } = normalizeChannelPayload(req.body);
+    const result = await pool.query(
+      `UPDATE channels
+       SET name = $1, gp_percent = $2, is_active = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4
+       RETURNING *`,
+      [name, gpPercent, isActive, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Channel not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'Channel name already exists' });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -1007,7 +1076,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     await client.query('BEGIN');
 
     // 1. ดึงข้อมูลช่องทางขาย (% GP)
-    const channelRes = await client.query('SELECT name, gp_percent FROM channels WHERE id = $1', [channel_id]);
+    const channelRes = await client.query('SELECT name, gp_percent FROM channels WHERE id = $1 AND is_active = TRUE', [channel_id]);
     if (channelRes.rows.length === 0) {
       throw requestError('Invalid channel_id');
     }
