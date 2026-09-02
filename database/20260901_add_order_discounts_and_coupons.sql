@@ -148,6 +148,50 @@ CREATE INDEX IF NOT EXISTS stock_receipt_items_receipt_idx
 CREATE INDEX IF NOT EXISTS inventory_movements_ingredient_idx
   ON inventory_movements(ingredient_id, created_at DESC);
 
+-- Inventory lots: every receiving line creates one lot. Orders allocate stock by FEFO.
+CREATE TABLE IF NOT EXISTS inventory_lots (
+  id BIGSERIAL PRIMARY KEY,
+  ingredient_id BIGINT NOT NULL REFERENCES ingredients(id) ON DELETE RESTRICT,
+  stock_receipt_item_id BIGINT REFERENCES stock_receipt_items(id) ON DELETE SET NULL,
+  lot_no VARCHAR(100) NOT NULL DEFAULT '',
+  received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expiry_date DATE,
+  initial_quantity NUMERIC(12, 3) NOT NULL CHECK (initial_quantity > 0),
+  remaining_quantity NUMERIC(12, 3) NOT NULL CHECK (remaining_quantity >= 0),
+  unit_cost NUMERIC(12, 4) NOT NULL DEFAULT 0 CHECK (unit_cost >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS order_item_lot_allocations (
+  id BIGSERIAL PRIMARY KEY,
+  order_item_id BIGINT NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+  inventory_lot_id BIGINT NOT NULL REFERENCES inventory_lots(id) ON DELETE RESTRICT,
+  quantity NUMERIC(12, 3) NOT NULL CHECK (quantity > 0),
+  unit_cost NUMERIC(12, 4) NOT NULL CHECK (unit_cost >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS inventory_lots_receipt_item_unique_idx
+  ON inventory_lots(stock_receipt_item_id)
+  WHERE stock_receipt_item_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS inventory_lots_fefo_idx
+  ON inventory_lots(ingredient_id, expiry_date, received_at)
+  WHERE remaining_quantity > 0;
+CREATE INDEX IF NOT EXISTS order_item_lot_allocations_order_item_idx
+  ON order_item_lot_allocations(order_item_id);
+
+-- Open one starting lot for existing inventory that predates lot tracking.
+INSERT INTO inventory_lots
+  (ingredient_id, lot_no, received_at, expiry_date, initial_quantity, remaining_quantity, unit_cost)
+SELECT i.id, 'OPENING-' || i.id, CURRENT_TIMESTAMP, i.expiry_date,
+       i.stock_qty, i.stock_qty, i.cost_per_unit
+FROM ingredients i
+WHERE i.stock_qty > 0
+  AND NOT EXISTS (
+    SELECT 1 FROM inventory_lots il WHERE il.ingredient_id = i.id
+  );
+
 -- Example coupon: 10% off, cap at 50 baht, minimum order 100 baht, usable 100 times.
 -- INSERT INTO coupons (code, discount_type, discount_value, min_order_amount, max_discount_amount, usage_limit)
 -- VALUES ('WELCOME10', 'PERCENT', 10, 100, 50, 100);

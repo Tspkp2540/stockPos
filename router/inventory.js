@@ -1,38 +1,77 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
+const { addInventoryLot, applyLotAdjustment, automaticLotNo } = require('../utils/inventoryLots');
 
 const numeric = (value) => Number(value);
 const text = (value, maxLength = 500) => String(value || '').trim().slice(0, maxLength);
 const newReceiptNo = () => `RCV-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+const validDate = (value) => !value || (/^\d{4}-\d{2}-\d{2}$/.test(String(value)) && !Number.isNaN(new Date(`${value}T00:00:00`).getTime()));
 const normalizeReceiptItems = (items) => {
   if (!Array.isArray(items) || !items.length) throw new Error('ต้องมีรายการวัตถุดิบอย่างน้อย 1 รายการ');
-  const grouped = new Map();
-  for (const item of items) {
+  return items.map((item) => {
     const ingredientId = Number(item?.ingredient_id);
     const quantity = numeric(item?.quantity);
     const unitCost = numeric(item?.unit_cost);
-    if (!Number.isInteger(ingredientId) || ingredientId <= 0 || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitCost) || unitCost < 0) {
+    const expiryDate = item?.expiry_date ? String(item.expiry_date).slice(0, 10) : null;
+    if (!Number.isInteger(ingredientId) || ingredientId <= 0 || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitCost) || unitCost < 0 || !validDate(expiryDate)) {
       throw new Error('ข้อมูลรายการรับวัตถุดิบไม่ถูกต้อง');
     }
-    const previous = grouped.get(ingredientId) || { ingredient_id: ingredientId, quantity: 0, unit_cost: unitCost };
-    if (previous.unit_cost !== unitCost && previous.quantity > 0) throw new Error('วัตถุดิบหนึ่งรายการต้องใช้ต้นทุนต่อหน่วยเดียวกันในใบรับเดียว');
-    grouped.set(ingredientId, { ...previous, quantity: previous.quantity + quantity, unit_cost: unitCost });
-  }
-  return [...grouped.values()];
+    return {
+      ingredient_id: ingredientId,
+      quantity,
+      unit_cost: unitCost,
+      lot_no: text(item?.lot_no, 100),
+      expiry_date: expiryDate,
+    };
+  });
 };
 
 // 📌 GET /api/inventory - ดึงรายการวัตถุดิบทั้งหมด
 router.get('/', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT *, 
+      `SELECT i.*,
         CASE 
-          WHEN stock_qty <= min_stock_alert THEN true 
+          WHEN i.stock_qty <= i.min_stock_alert THEN true
           ELSE false 
-        END AS is_low_stock
-       FROM ingredients 
-       ORDER BY id ASC`
+        END AS is_low_stock,
+        (SELECT MIN(il.expiry_date)
+         FROM inventory_lots il
+         WHERE il.ingredient_id = i.id AND il.remaining_quantity > 0 AND il.expiry_date IS NOT NULL) AS next_expiry_date,
+        (SELECT COUNT(*) FROM inventory_lots il WHERE il.ingredient_id = i.id AND il.remaining_quantity > 0) AS active_lot_count
+       FROM ingredients i
+       ORDER BY i.id ASC`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ล็อตที่ยังเหลือสำหรับตรวจสอบอายุและย้อนกลับการรับของ
+router.get('/lots', async (req, res) => {
+  const ingredientId = req.query?.ingredient_id ? Number(req.query.ingredient_id) : null;
+  const activeOnly = String(req.query?.active || 'true') !== 'false';
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 300, 1), 1000);
+  if (ingredientId !== null && (!Number.isInteger(ingredientId) || ingredientId <= 0)) {
+    return res.status(400).json({ success: false, error: 'รหัสวัตถุดิบไม่ถูกต้อง' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT il.id, il.ingredient_id, i.name AS ingredient_name, i.unit, il.lot_no,
+              il.received_at, il.expiry_date, il.initial_quantity, il.remaining_quantity, il.unit_cost,
+              sr.receipt_no, s.name AS supplier_name
+       FROM inventory_lots il
+       JOIN ingredients i ON i.id = il.ingredient_id
+       LEFT JOIN stock_receipt_items sri ON sri.id = il.stock_receipt_item_id
+       LEFT JOIN stock_receipts sr ON sr.id = sri.receipt_id
+       LEFT JOIN suppliers s ON s.id = sr.supplier_id
+       WHERE ($1::bigint IS NULL OR il.ingredient_id = $1)
+         AND ($2::boolean = FALSE OR il.remaining_quantity > 0)
+       ORDER BY il.expiry_date ASC NULLS LAST, il.received_at ASC, il.id ASC
+       LIMIT $3`,
+      [ingredientId, activeOnly, limit]
     );
     res.json({ success: true, data: result.rows });
   } catch (error) {
@@ -108,10 +147,12 @@ router.get('/receipts', async (req, res) => {
               COALESCE((
                 SELECT json_agg(json_build_object(
                   'id', sri.id, 'ingredient_id', sri.ingredient_id, 'ingredient_name', i.name,
-                  'unit', i.unit, 'quantity', sri.quantity, 'unit_cost', sri.unit_cost, 'line_total', sri.line_total
+                  'unit', i.unit, 'quantity', sri.quantity, 'unit_cost', sri.unit_cost, 'line_total', sri.line_total,
+                  'lot_no', il.lot_no, 'expiry_date', il.expiry_date
                 ) ORDER BY sri.id)
                 FROM stock_receipt_items sri
                 JOIN ingredients i ON i.id = sri.ingredient_id
+                LEFT JOIN inventory_lots il ON il.stock_receipt_item_id = sri.id
                 WHERE sri.receipt_id = sr.id
               ), '[]'::json) AS items
        FROM stock_receipts sr
@@ -157,6 +198,7 @@ router.post('/receipts', async (req, res) => {
     );
     const receiptId = receipt.rows[0].id;
     const updatedIngredients = [];
+    const createdLots = [];
     let totalAmount = 0;
     for (const item of items) {
       const ingredient = await client.query(
@@ -176,11 +218,20 @@ router.post('/receipts', async (req, res) => {
          RETURNING *, CASE WHEN stock_qty <= min_stock_alert THEN true ELSE false END AS is_low_stock`,
         [nextQty, Number(nextCost.toFixed(4)), item.ingredient_id]
       );
-      await client.query(
+      const receiptItem = await client.query(
         `INSERT INTO stock_receipt_items (receipt_id, ingredient_id, quantity, unit_cost, line_total)
-         VALUES ($1, $2, $3, $4, $5)`,
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
         [receiptId, item.ingredient_id, item.quantity, item.unit_cost, lineTotal]
       );
+      const lot = await addInventoryLot(client, {
+        ingredientId: item.ingredient_id,
+        receiptItemId: receiptItem.rows[0].id,
+        quantity: item.quantity,
+        unitCost: item.unit_cost,
+        lotNo: item.lot_no || automaticLotNo('RCV'),
+        receivedAt,
+        expiryDate: item.expiry_date,
+      });
       await client.query(
         `INSERT INTO inventory_movements
          (ingredient_id, movement_type, quantity_change, unit_cost, reference_type, reference_id, note, created_by)
@@ -189,6 +240,7 @@ router.post('/receipts', async (req, res) => {
       );
       totalAmount += lineTotal;
       updatedIngredients.push(updated.rows[0]);
+      createdLots.push(lot);
     }
     const finalized = await client.query(
       `UPDATE stock_receipts SET total_amount = $1 WHERE id = $2
@@ -196,7 +248,7 @@ router.post('/receipts', async (req, res) => {
       [Number(totalAmount.toFixed(2)), receiptId]
     );
     await client.query('COMMIT');
-    res.status(201).json({ success: true, data: { ...finalized.rows[0], updated_ingredients: updatedIngredients } });
+    res.status(201).json({ success: true, data: { ...finalized.rows[0], updated_ingredients: updatedIngredients, created_lots: createdLots } });
   } catch (error) {
     await client.query('ROLLBACK');
     res.status(400).json({ success: false, error: error.message });
@@ -263,6 +315,12 @@ router.post('/adjustments', async (req, res) => {
     const nextQty = adjustmentType === 'STOCK_COUNT' ? actualQuantity : currentQty - wasteQuantity;
     if (nextQty < 0) throw new Error('ยอดของเสียมากกว่าสต็อกคงเหลือ');
     const difference = Number((nextQty - currentQty).toFixed(3));
+    const affectedLots = await applyLotAdjustment(client, {
+      ingredientId,
+      difference,
+      unitCost: ingredient.cost_per_unit,
+      note: note || 'ตรวจนับสต็อก',
+    });
     const updated = await client.query(
       `UPDATE ingredients
        SET stock_qty = $1, updated_at = CURRENT_TIMESTAMP
@@ -279,7 +337,7 @@ router.post('/adjustments', async (req, res) => {
     await client.query('COMMIT');
     res.json({
       success: true,
-      data: { ingredient: updated.rows[0], difference, adjustment_type: adjustmentType },
+      data: { ingredient: updated.rows[0], difference, adjustment_type: adjustmentType, affected_lots: affectedLots },
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -298,16 +356,31 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid inventory payload' });
   }
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    const result = await client.query(
       `INSERT INTO ingredients (name, unit, stock_qty, cost_per_unit, min_stock_alert, expiry_date)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *,
        CASE WHEN stock_qty <= min_stock_alert THEN true ELSE false END AS is_low_stock`,
       [name, unit, stock, Number(cost_per_unit || 0), Number(min_stock_alert || 0), expiry_date || null]
     );
+    if (stock > 0) {
+      await addInventoryLot(client, {
+        ingredientId: result.rows[0].id,
+        quantity: stock,
+        unitCost: Number(cost_per_unit || 0),
+        lotNo: automaticLotNo('OPENING'),
+        expiryDate: expiry_date || null,
+      });
+    }
+    await client.query('COMMIT');
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
+    await client.query('ROLLBACK');
     res.status(500).json({ success: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -320,8 +393,19 @@ router.put('/:id', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid inventory payload' });
   }
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    const current = await client.query('SELECT id, stock_qty, cost_per_unit FROM ingredients WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!current.rows.length) throw new Error('Ingredient not found');
+    const difference = Number((stock - Number(current.rows[0].stock_qty || 0)).toFixed(3));
+    await applyLotAdjustment(client, {
+      ingredientId: Number(req.params.id),
+      difference,
+      unitCost: Number(cost_per_unit || current.rows[0].cost_per_unit || 0),
+      note: 'แก้ไขยอดคงเหลือจากหน้าวัตถุดิบ',
+    });
+    const result = await client.query(
       `UPDATE ingredients
        SET name = $1, unit = $2, stock_qty = $3, cost_per_unit = $4,
            min_stock_alert = $5, expiry_date = $6, updated_at = CURRENT_TIMESTAMP
@@ -330,10 +414,14 @@ router.put('/:id', async (req, res) => {
       [name, unit, stock, Number(cost_per_unit || 0), Number(min_stock_alert || 0), expiry_date || null, req.params.id]
     );
 
-    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Ingredient not found' });
+    if (!result.rows.length) throw new Error('Ingredient not found');
+    await client.query('COMMIT');
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    await client.query('ROLLBACK');
+    res.status(error.message === 'Ingredient not found' ? 404 : 400).json({ success: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -379,6 +467,15 @@ router.post('/restock', async (req, res) => {
        RETURNING *, CASE WHEN stock_qty <= min_stock_alert THEN true ELSE false END AS is_low_stock`,
       [nextQty, Number(nextCost.toFixed(4)), ingredient_id]
     );
+    const lot = await addInventoryLot(client, {
+      ingredientId: Number(ingredient_id),
+      quantity,
+      unitCost: hasNewCost ? unitCost : Number(existing.cost_per_unit || 0),
+      lotNo: text(req.body?.lot_no, 100) || automaticLotNo('RESTOCK'),
+      expiryDate: req.body?.expiry_date && validDate(String(req.body.expiry_date).slice(0, 10))
+        ? String(req.body.expiry_date).slice(0, 10)
+        : null,
+    });
     await client.query(
       `INSERT INTO inventory_movements
        (ingredient_id, movement_type, quantity_change, unit_cost, reference_type, note, created_by)
@@ -390,7 +487,7 @@ router.post('/restock', async (req, res) => {
     res.json({
       success: true,
       message: 'Restocked successfully',
-      data: result.rows[0]
+      data: { ...result.rows[0], created_lot: lot }
     });
   } catch (error) {
     await client.query('ROLLBACK');

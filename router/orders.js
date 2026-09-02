@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const { requireRoles } = require('../middleware/auth');
+const { addInventoryLot, restoreOrderLots } = require('../utils/inventoryLots');
 
 // POST /api/orders - รับออเดอร์ใหม่
 router.post('/orders', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
@@ -134,6 +135,18 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
       throw new Error('Order is already cancelled');
     }
 
+    const previousIngredients = await client.query(
+      `SELECT r.ingredient_id, SUM(r.quantity_used * oi.quantity) AS quantity_to_restore,
+              MAX(i.cost_per_unit) AS unit_cost
+       FROM order_items oi
+       JOIN recipes r ON r.product_id = oi.product_id
+       JOIN ingredients i ON i.id = r.ingredient_id
+       WHERE oi.order_id = $1
+       GROUP BY r.ingredient_id`,
+      [id]
+    );
+    const restoredLotCount = await restoreOrderLots(client, id);
+
     // 2. คืนสต็อควัตถุดิบตามรายการใน Order Items และ Recipes
     await client.query(
       `UPDATE ingredients ing
@@ -152,6 +165,16 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
        WHERE id = $1 RETURNING *`,
       [id]
     );
+    if (!restoredLotCount) {
+      for (const row of previousIngredients.rows) {
+        await addInventoryLot(client, {
+          ingredientId: row.ingredient_id,
+          quantity: row.quantity_to_restore,
+          unitCost: row.unit_cost,
+          lotNo: `LEGACY-CANCEL-${id}-${row.ingredient_id}`,
+        });
+      }
+    }
     await client.query(
       `UPDATE order_payments
        SET status = 'VOIDED'

@@ -11,6 +11,7 @@ const server = http.createServer(app);
 const ordersRouter = require('../router/orders');
 const inventoryRouter = require('../router/inventory');
 const productsRouter = require('../router/products');
+const { addInventoryLot, consumeLots, restoreOrderLots } = require('../utils/inventoryLots');
 
 const isValidRecordDate = (value) => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -255,6 +256,46 @@ const startServer = async () => {
     await client.query('CREATE INDEX IF NOT EXISTS stock_receipts_received_at_idx ON stock_receipts(received_at DESC)');
     await client.query('CREATE INDEX IF NOT EXISTS stock_receipt_items_receipt_idx ON stock_receipt_items(receipt_id)');
     await client.query('CREATE INDEX IF NOT EXISTS inventory_movements_ingredient_idx ON inventory_movements(ingredient_id, created_at DESC)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS inventory_lots (
+        id BIGSERIAL PRIMARY KEY,
+        ingredient_id BIGINT NOT NULL REFERENCES ingredients(id) ON DELETE RESTRICT,
+        stock_receipt_item_id BIGINT REFERENCES stock_receipt_items(id) ON DELETE SET NULL,
+        lot_no VARCHAR(100) NOT NULL DEFAULT '',
+        received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expiry_date DATE,
+        initial_quantity NUMERIC(12, 3) NOT NULL CHECK (initial_quantity > 0),
+        remaining_quantity NUMERIC(12, 3) NOT NULL CHECK (remaining_quantity >= 0),
+        unit_cost NUMERIC(12, 4) NOT NULL DEFAULT 0 CHECK (unit_cost >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_item_lot_allocations (
+        id BIGSERIAL PRIMARY KEY,
+        order_item_id BIGINT NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+        inventory_lot_id BIGINT NOT NULL REFERENCES inventory_lots(id) ON DELETE RESTRICT,
+        quantity NUMERIC(12, 3) NOT NULL CHECK (quantity > 0),
+        unit_cost NUMERIC(12, 4) NOT NULL CHECK (unit_cost >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query('CREATE UNIQUE INDEX IF NOT EXISTS inventory_lots_receipt_item_unique_idx ON inventory_lots(stock_receipt_item_id) WHERE stock_receipt_item_id IS NOT NULL');
+    await client.query('CREATE INDEX IF NOT EXISTS inventory_lots_fefo_idx ON inventory_lots(ingredient_id, expiry_date, received_at) WHERE remaining_quantity > 0');
+    await client.query('CREATE INDEX IF NOT EXISTS order_item_lot_allocations_order_item_idx ON order_item_lot_allocations(order_item_id)');
+    await client.query(`
+      INSERT INTO inventory_lots
+        (ingredient_id, lot_no, received_at, expiry_date, initial_quantity, remaining_quantity, unit_cost)
+      SELECT i.id, 'OPENING-' || i.id, CURRENT_TIMESTAMP, i.expiry_date,
+             i.stock_qty, i.stock_qty, i.cost_per_unit
+      FROM ingredients i
+      WHERE i.stock_qty > 0
+        AND NOT EXISTS (
+          SELECT 1 FROM inventory_lots il
+          WHERE il.ingredient_id = i.id
+        )
+    `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS expenses (
         id BIGSERIAL PRIMARY KEY,
@@ -904,25 +945,29 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
         );
       }
 
-      // 3.2 ตัดสต็อควัตถุดิบตามสูตร (BOM - Bill of Materials)
-      await client.query(
-        `UPDATE ingredients ing
-         SET stock_qty = ing.stock_qty - (r.quantity_used * $1),
-             updated_at = CURRENT_TIMESTAMP
+      // 3.2 ตัดวัตถุดิบตามล็อตแบบ FEFO (ล็อตใกล้หมดอายุก่อน) และเก็บต้นทุนล็อตจริง
+      const recipeResult = await client.query(
+        `SELECT r.ingredient_id, r.quantity_used, i.name, i.stock_qty
          FROM recipes r
-         WHERE ing.id = r.ingredient_id AND r.product_id = $2`,
-        [quantity, item.product_id]
+         JOIN ingredients i ON i.id = r.ingredient_id
+         WHERE r.product_id = $1
+         FOR UPDATE OF i`,
+        [item.product_id]
       );
-
-      // 3.3 คำนวณต้นทุนวัตถุดิบ (COGS) ของรายการนี้
-      const cogsRes = await client.query(
-        `SELECT COALESCE(SUM(r.quantity_used * i.cost_per_unit * $1), 0) AS item_cogs
-         FROM recipes r
-         JOIN ingredients i ON r.ingredient_id = i.id
-         WHERE r.product_id = $2`,
-        [quantity, item.product_id]
-      );
-      totalCogs += parseFloat(cogsRes.rows[0].item_cogs);
+      for (const recipeItem of recipeResult.rows) {
+        const requiredQuantity = Number(recipeItem.quantity_used) * quantity;
+        if (Number(recipeItem.stock_qty || 0) + 0.000001 < requiredQuantity) {
+          throw requestError(`Insufficient stock for ${recipeItem.name}`);
+        }
+        const allocation = await consumeLots(client, recipeItem.ingredient_id, requiredQuantity, { orderItemId });
+        await client.query(
+          `UPDATE ingredients
+           SET stock_qty = stock_qty - $1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2`,
+          [requiredQuantity, recipeItem.ingredient_id]
+        );
+        totalCogs += Number(allocation.totalCost || 0);
+      }
     }
 
     const manualDiscountAmount = Math.min(subtotalAmount, requestedManualDiscount);
@@ -1072,7 +1117,18 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
     const channelResult = await client.query('SELECT gp_percent FROM channels WHERE id = $1', [channel_id]);
     if (!channelResult.rows.length) throw new Error('Invalid channel_id');
 
-    // คืนสต็อกของ record เดิมก่อน แล้วจึงตรวจสอบและตัดตามรายการใหม่
+    const previousIngredients = await client.query(
+      `SELECT r.ingredient_id, SUM(r.quantity_used * oi.quantity) AS quantity_to_restore,
+              MAX(i.cost_per_unit) AS unit_cost
+       FROM order_items oi
+       JOIN recipes r ON r.product_id = oi.product_id
+       JOIN ingredients i ON i.id = r.ingredient_id
+       WHERE oi.order_id = $1
+       GROUP BY r.ingredient_id`,
+      [id]
+    );
+    const restoredLotCount = await restoreOrderLots(client, id);
+    // คืนยอดรวมของ record เดิมก่อน แล้วจึงตรวจสอบและตัดตามรายการใหม่
     await client.query(
       `UPDATE ingredients ing
        SET stock_qty = ing.stock_qty + (r.quantity_used * oi.quantity), updated_at = CURRENT_TIMESTAMP
@@ -1081,6 +1137,17 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
        WHERE oi.order_id = $1 AND ing.id = r.ingredient_id`,
       [id]
     );
+    // ออเดอร์เก่าก่อนเริ่มระบบล็อตไม่มี allocation จึงสร้างล็อตคืนยอดเพื่อให้ยอดรวมและล็อตสอดคล้องกัน
+    if (!restoredLotCount) {
+      for (const row of previousIngredients.rows) {
+        await addInventoryLot(client, {
+          ingredientId: row.ingredient_id,
+          quantity: row.quantity_to_restore,
+          unitCost: row.unit_cost,
+          lotNo: `LEGACY-RESTORE-${id}-${row.ingredient_id}`,
+        });
+      }
+    }
     await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
 
     let subtotalAmount = 0;
@@ -1089,16 +1156,11 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
       const productResult = await client.query('SELECT id FROM products WHERE id = $1', [item.product_id]);
       if (!productResult.rows.length) throw new Error(`Product #${item.product_id} not found`);
       const recipeResult = await client.query(
-        `SELECT r.ingredient_id, r.quantity_used, i.name, i.stock_qty, i.cost_per_unit
+        `SELECT r.ingredient_id, r.quantity_used, i.name, i.stock_qty
          FROM recipes r JOIN ingredients i ON i.id = r.ingredient_id
-         WHERE r.product_id = $1 FOR UPDATE`,
+         WHERE r.product_id = $1 FOR UPDATE OF i`,
         [item.product_id]
       );
-      for (const recipeItem of recipeResult.rows) {
-        const requiredQty = Number(recipeItem.quantity_used) * item.qty;
-        if (Number(recipeItem.stock_qty) < requiredQty) throw new Error(`Insufficient stock for ${recipeItem.name}`);
-        totalCogs += requiredQty * Number(recipeItem.cost_per_unit || 0);
-      }
       const quantity = Number(item.qty);
       const unitPrice = Number(item.price);
       if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
@@ -1106,15 +1168,20 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
       }
       const subtotal = quantity * unitPrice;
       subtotalAmount += subtotal;
-      await client.query(
-        'INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal) VALUES ($1, $2, $3, $4, $5)',
+      const orderItemResult = await client.query(
+        'INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal) VALUES ($1, $2, $3, $4, $5) RETURNING id',
         [id, item.product_id, quantity, unitPrice, subtotal]
       );
-      await client.query(
-        `UPDATE ingredients ing SET stock_qty = ing.stock_qty - (r.quantity_used * $1), updated_at = CURRENT_TIMESTAMP
-         FROM recipes r WHERE ing.id = r.ingredient_id AND r.product_id = $2`,
-        [quantity, item.product_id]
-      );
+      for (const recipeItem of recipeResult.rows) {
+        const requiredQty = Number(recipeItem.quantity_used) * quantity;
+        if (Number(recipeItem.stock_qty || 0) + 0.000001 < requiredQty) throw new Error(`Insufficient stock for ${recipeItem.name}`);
+        const allocation = await consumeLots(client, recipeItem.ingredient_id, requiredQty, { orderItemId: orderItemResult.rows[0].id });
+        totalCogs += Number(allocation.totalCost || 0);
+        await client.query(
+          'UPDATE ingredients SET stock_qty = stock_qty - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+          [requiredQty, recipeItem.ingredient_id]
+        );
+      }
     }
 
     const manualDiscountAmount = Math.min(
@@ -1182,6 +1249,17 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
     const orderResult = await client.query('SELECT id, status FROM orders WHERE id = $1 FOR UPDATE', [id]);
     if (!orderResult.rows.length) throw new Error('Order not found');
     if (orderResult.rows[0].status !== 'CANCELLED') {
+      const previousIngredients = await client.query(
+        `SELECT r.ingredient_id, SUM(r.quantity_used * oi.quantity) AS quantity_to_restore,
+                MAX(i.cost_per_unit) AS unit_cost
+         FROM order_items oi
+         JOIN recipes r ON r.product_id = oi.product_id
+         JOIN ingredients i ON i.id = r.ingredient_id
+         WHERE oi.order_id = $1
+         GROUP BY r.ingredient_id`,
+        [id]
+      );
+      const restoredLotCount = await restoreOrderLots(client, id);
       await client.query(
         `UPDATE ingredients ing
          SET stock_qty = ing.stock_qty + (r.quantity_used * oi.quantity), updated_at = CURRENT_TIMESTAMP
@@ -1190,6 +1268,16 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
          WHERE oi.order_id = $1 AND ing.id = r.ingredient_id`,
         [id]
       );
+      if (!restoredLotCount) {
+        for (const row of previousIngredients.rows) {
+          await addInventoryLot(client, {
+            ingredientId: row.ingredient_id,
+            quantity: row.quantity_to_restore,
+            unitCost: row.unit_cost,
+            lotNo: `LEGACY-DELETE-${id}-${row.ingredient_id}`,
+          });
+        }
+      }
     }
     await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
     await client.query('DELETE FROM orders WHERE id = $1', [id]);

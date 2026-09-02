@@ -59,6 +59,8 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
 
 `suppliers` เก็บข้อมูลผู้ขาย ส่วน `stock_receipts` และ `stock_receipt_items` เก็บใบรับของ ต้นทุนจริง และรายการที่รับเข้า เมื่อสร้างใบรับผ่าน `POST /api/inventory/receipts` ระบบจะ lock วัตถุดิบ, เพิ่มจำนวนคงเหลือ, คำนวณต้นทุนเฉลี่ยถ่วงน้ำหนัก และสร้าง `inventory_movements` ประเภท `PURCHASE` ภายใน transaction เดียวกัน จึงตรวจสอบย้อนกลับได้ว่าของเข้ามาจากใครและต้นทุนเท่าใด
 
+`inventory_lots` เก็บเลขล็อต วันรับเข้า วันหมดอายุ จำนวนเริ่มต้น และจำนวนคงเหลือของแต่ละล็อต ทุกการขายจะจัดสรรวัตถุดิบจากล็อตที่วันหมดอายุเร็วที่สุดก่อน (FEFO) ผ่าน `order_item_lot_allocations` และไม่ใช้ล็อตที่หมดอายุ การแก้ไขหรือลบออเดอร์ และการยกเลิก จะคืนปริมาณให้ล็อตเดิมเพื่อให้ยอดย้อนหลังถูกต้อง
+
 `POST /api/inventory/adjustments` ใช้สำหรับตรวจนับยอดจริง (`STOCK_COUNT`) หรือบันทึกของเสีย (`WASTE`) โดยบันทึกส่วนต่างเป็น `inventory_movements` ประเภท `ADJUSTMENT` ยอดคงเหลือจะไม่สามารถติดลบ และของเสียต้องระบุเหตุผลก่อนบันทึก
 
 ## การติดตั้งและรัน
@@ -112,7 +114,7 @@ Authorization: Bearer <token>
 | การเงิน | `GET /api/financial-summary`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
 | คูปอง | `POST /api/coupons/validate`, `GET/POST /api/coupons` | Staff/Admin, Admin |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
-| ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/movements` | Admin |
+| ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/lots`, `GET /api/inventory/movements` | Admin |
 | ตรวจนับ/ของเสีย | `POST /api/inventory/adjustments` | Admin |
 | ช่องทางขาย | `GET /api/channels` | Admin/Staff |
 
