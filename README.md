@@ -17,6 +17,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - รับชำระด้วยเงินสด, QR, โอน, บัตร หรืออื่น ๆ พร้อมยอดรับและเงินทอน
 - เปิด/ปิดกะเงินสดแยกตามผู้ใช้งาน และคำนวณยอดคาดการณ์กับยอดต่างเมื่อปิดกะ
 - จัดการผู้ขายและใบรับวัตถุดิบเข้า รองรับหลายรายการต่อใบ ปรับต้นทุนเฉลี่ย และเก็บประวัติการเคลื่อนไหวสต็อก
+- สร้างใบสั่งซื้อวัตถุดิบ ติดตามสถานะร่าง/ส่งผู้ขาย/รับของแล้ว และรับของเข้าคลังตามใบสั่งซื้อได้
 - สถานะเมนูพร้อมขายจากสูตร BOM และล็อตวัตถุดิบที่ยังไม่หมดอายุ พร้อมปิดขายชั่วคราวรายเมนูโดย Admin
 - ส่งเหตุการณ์แบบ real-time ผ่าน Socket.IO ให้หน้า POS, คิว และศูนย์ปฏิบัติการอัปเดตทันที
 
@@ -59,6 +60,8 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
 ## ผู้ขายและการรับวัตถุดิบเข้า
 
 `suppliers` เก็บข้อมูลผู้ขาย ส่วน `stock_receipts` และ `stock_receipt_items` เก็บใบรับของ ต้นทุนจริง และรายการที่รับเข้า เมื่อสร้างใบรับผ่าน `POST /api/inventory/receipts` ระบบจะ lock วัตถุดิบ, เพิ่มจำนวนคงเหลือ, คำนวณต้นทุนเฉลี่ยถ่วงน้ำหนัก และสร้าง `inventory_movements` ประเภท `PURCHASE` ภายใน transaction เดียวกัน จึงตรวจสอบย้อนกลับได้ว่าของเข้ามาจากใครและต้นทุนเท่าใด
+
+`purchase_orders` และ `purchase_order_items` เก็บแผนการสั่งซื้อแยกจากการรับของจริง สถานะเดินตาม `DRAFT → SENT → RECEIVED` หรือ `CANCELLED` เมื่อเรียก `POST /api/purchase-orders/:id/receive` ระบบจะสร้าง `stock_receipts` เชื่อมกับใบสั่งซื้อนั้น แล้วเพิ่มสต็อก สร้างล็อต และบันทึกการเคลื่อนไหวใน transaction เดียวกัน จึงรับของซ้ำจากใบเดิมไม่ได้
 
 `inventory_lots` เก็บเลขล็อต วันรับเข้า วันหมดอายุ จำนวนเริ่มต้น และจำนวนคงเหลือของแต่ละล็อต ทุกการขายจะจัดสรรวัตถุดิบจากล็อตที่วันหมดอายุเร็วที่สุดก่อน (FEFO) ผ่าน `order_item_lot_allocations` และไม่ใช้ล็อตที่หมดอายุ การแก้ไขหรือลบออเดอร์ และการยกเลิก จะคืนปริมาณให้ล็อตเดิมเพื่อให้ยอดย้อนหลังถูกต้อง
 
@@ -118,6 +121,7 @@ Authorization: Bearer <token>
 | คูปอง | `POST /api/coupons/validate`, `GET/POST /api/coupons` | Staff/Admin, Admin |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
 | ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/lots`, `GET /api/inventory/movements` | Admin |
+| ใบสั่งซื้อ | `GET/POST /api/purchase-orders`, `PATCH /api/purchase-orders/:id/status`, `POST /api/purchase-orders/:id/receive` | Admin |
 | ตรวจนับ/ของเสีย | `POST /api/inventory/adjustments` | Admin |
 | ช่องทางขาย | `GET /api/channels` | Admin/Staff |
 

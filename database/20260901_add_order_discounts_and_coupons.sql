@@ -110,16 +110,45 @@ CREATE TABLE IF NOT EXISTS suppliers (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Purchase orders: keep the planned purchase separate from the actual stock receipt.
+CREATE TABLE IF NOT EXISTS purchase_orders (
+  id BIGSERIAL PRIMARY KEY,
+  po_no VARCHAR(64) NOT NULL UNIQUE,
+  supplier_id BIGINT REFERENCES suppliers(id) ON DELETE SET NULL,
+  status VARCHAR(16) NOT NULL DEFAULT 'DRAFT'
+    CHECK (status IN ('DRAFT', 'SENT', 'RECEIVED', 'CANCELLED')),
+  expected_date DATE,
+  note TEXT NOT NULL DEFAULT '',
+  created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  sent_at TIMESTAMPTZ,
+  received_at TIMESTAMPTZ,
+  cancelled_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS purchase_order_items (
+  id BIGSERIAL PRIMARY KEY,
+  purchase_order_id BIGINT NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  ingredient_id BIGINT NOT NULL REFERENCES ingredients(id) ON DELETE RESTRICT,
+  quantity NUMERIC(12, 3) NOT NULL CHECK (quantity > 0),
+  unit_cost NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (unit_cost >= 0),
+  line_total NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (line_total >= 0)
+);
+
 CREATE TABLE IF NOT EXISTS stock_receipts (
   id BIGSERIAL PRIMARY KEY,
   receipt_no VARCHAR(64) NOT NULL UNIQUE,
   supplier_id BIGINT REFERENCES suppliers(id) ON DELETE SET NULL,
+  purchase_order_id BIGINT REFERENCES purchase_orders(id) ON DELETE SET NULL,
   received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
   note TEXT NOT NULL DEFAULT '',
   total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
   created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE stock_receipts
+  ADD COLUMN IF NOT EXISTS purchase_order_id BIGINT REFERENCES purchase_orders(id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS stock_receipt_items (
   id BIGSERIAL PRIMARY KEY,
@@ -146,6 +175,12 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
 
 CREATE INDEX IF NOT EXISTS stock_receipts_received_at_idx
   ON stock_receipts(received_at DESC);
+CREATE INDEX IF NOT EXISTS purchase_orders_status_created_idx
+  ON purchase_orders(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS purchase_order_items_order_idx
+  ON purchase_order_items(purchase_order_id);
+CREATE INDEX IF NOT EXISTS stock_receipts_purchase_order_idx
+  ON stock_receipts(purchase_order_id);
 CREATE INDEX IF NOT EXISTS stock_receipt_items_receipt_idx
   ON stock_receipt_items(receipt_id);
 CREATE INDEX IF NOT EXISTS inventory_movements_ingredient_idx
