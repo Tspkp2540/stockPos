@@ -141,8 +141,8 @@ const startServer = async () => {
     for (const [name, feePercent] of [['Front Store', 0], ['GrabFood', 30], ['LINE MAN', 30]]) {
       await client.query(
         `INSERT INTO channels (name, gp_percent)
-         SELECT $1, $2
-         WHERE NOT EXISTS (SELECT 1 FROM channels WHERE LOWER(name) = LOWER($1))`,
+         SELECT $1::varchar, $2
+         WHERE NOT EXISTS (SELECT 1 FROM channels WHERE LOWER(name) = LOWER($1::text))`,
         [name, feePercent]
       );
     }
