@@ -21,6 +21,11 @@ const isValidRecordDate = (value) => {
 };
 
 const selectedRecordDate = (value) => isValidRecordDate(value) ? value : null;
+const shiftRecordDate = (value, days) => {
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+};
 const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
 const isValidPhone = (value) => /^\d{9,15}$/.test(value);
 const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase() });
@@ -1046,6 +1051,107 @@ app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), async (req, 
       data: {
         channels: channelResult.rows,
         payments: paymentResult.rows,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 📈 GET /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD - รายงานยอดขายเพื่อบริหารร้าน
+app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const from = selectedRecordDate(req.query?.from);
+  const to = selectedRecordDate(req.query?.to);
+  if (!from || !to || from > to) {
+    return res.status(400).json({ success: false, error: 'Please provide a valid report period' });
+  }
+
+  const periodDays = Math.floor((new Date(`${to}T00:00:00.000Z`) - new Date(`${from}T00:00:00.000Z`)) / 86400000) + 1;
+  const previousTo = shiftRecordDate(from, -1);
+  const previousFrom = shiftRecordDate(previousTo, -(periodDays - 1));
+  const dateFilter = "DATE(o.created_at AT TIME ZONE 'Asia/Bangkok') BETWEEN $1::date AND $2::date";
+  const expenseDateFilter = "DATE(e.created_at AT TIME ZONE 'Asia/Bangkok') BETWEEN $1::date AND $2::date";
+  const summaryQuery = `
+    SELECT COUNT(o.id)::int AS order_count,
+           COALESCE(SUM(o.gross_amount), 0) AS gross_amount,
+           COALESCE(SUM(o.net_revenue), 0) AS net_revenue,
+           COALESCE(SUM(o.total_cogs), 0) AS total_cogs,
+           COALESCE(SUM(o.net_profit), 0) AS gross_profit,
+           COALESCE(SUM(o.manual_discount_amount), 0) + COALESCE(SUM(o.coupon_discount_amount), 0) + COALESCE(SUM(o.loyalty_discount_amount), 0) AS discount_amount
+    FROM orders o
+    WHERE ${dateFilter} AND o.status <> 'CANCELLED'`;
+  const expensesQuery = `SELECT COALESCE(SUM(e.amount), 0) AS expenses FROM expenses e WHERE ${expenseDateFilter}`;
+
+  try {
+    const [summaryResult, previousSummaryResult, expenseResult, previousExpenseResult, dailyResult, topProductsResult, inventoryUsageResult] = await Promise.all([
+      pool.query(summaryQuery, [from, to]),
+      pool.query(summaryQuery, [previousFrom, previousTo]),
+      pool.query(expensesQuery, [from, to]),
+      pool.query(expensesQuery, [previousFrom, previousTo]),
+      pool.query(
+        `SELECT DATE(o.created_at AT TIME ZONE 'Asia/Bangkok')::text AS record_date,
+                COUNT(o.id)::int AS order_count,
+                COALESCE(SUM(o.net_revenue), 0) AS net_revenue,
+                COALESCE(SUM(o.net_profit), 0) AS gross_profit
+         FROM orders o
+         WHERE ${dateFilter} AND o.status <> 'CANCELLED'
+         GROUP BY DATE(o.created_at AT TIME ZONE 'Asia/Bangkok')
+         ORDER BY DATE(o.created_at AT TIME ZONE 'Asia/Bangkok') ASC`,
+        [from, to]
+      ),
+      pool.query(
+        `SELECT p.id AS product_id, COALESCE(p.name, 'เมนูที่ถูกลบ') AS product_name,
+                COALESCE(SUM(oi.quantity), 0) AS quantity_sold,
+                COALESCE(SUM(oi.subtotal), 0) AS sales_amount,
+                COUNT(DISTINCT o.id)::int AS order_count
+         FROM orders o
+         JOIN order_items oi ON oi.order_id = o.id
+         LEFT JOIN products p ON p.id = oi.product_id
+         WHERE ${dateFilter} AND o.status <> 'CANCELLED'
+         GROUP BY p.id, p.name
+         ORDER BY quantity_sold DESC, sales_amount DESC, product_name ASC
+         LIMIT 5`,
+        [from, to]
+      ),
+      pool.query(
+        `SELECT i.id AS ingredient_id, i.name AS ingredient_name, i.unit,
+                COALESCE(SUM(oila.quantity), 0) AS quantity_used,
+                COALESCE(SUM(oila.quantity * oila.unit_cost), 0) AS usage_cost
+         FROM orders o
+         JOIN order_items oi ON oi.order_id = o.id
+         JOIN order_item_lot_allocations oila ON oila.order_item_id = oi.id
+         JOIN inventory_lots il ON il.id = oila.inventory_lot_id
+         JOIN ingredients i ON i.id = il.ingredient_id
+         WHERE ${dateFilter} AND o.status <> 'CANCELLED'
+         GROUP BY i.id, i.name, i.unit
+         ORDER BY quantity_used DESC, usage_cost DESC, ingredient_name ASC
+         LIMIT 8`,
+        [from, to]
+      ),
+    ]);
+    const formatSummary = (summary, expenses) => {
+      const grossProfit = Number(summary.gross_profit || 0);
+      const expenseTotal = Number(expenses.expenses || 0);
+      return {
+        order_count: Number(summary.order_count || 0),
+        gross_amount: Number(summary.gross_amount || 0),
+        net_revenue: Number(summary.net_revenue || 0),
+        total_cogs: Number(summary.total_cogs || 0),
+        gross_profit: grossProfit,
+        discount_amount: Number(summary.discount_amount || 0),
+        expenses: expenseTotal,
+        operating_profit: grossProfit - expenseTotal,
+      };
+    };
+    res.json({
+      success: true,
+      data: {
+        period: { from, to, previous_from: previousFrom, previous_to: previousTo },
+        summary: formatSummary(summaryResult.rows[0] || {}, expenseResult.rows[0] || {}),
+        previous_summary: formatSummary(previousSummaryResult.rows[0] || {}, previousExpenseResult.rows[0] || {}),
+        daily: dailyResult.rows,
+        top_products: topProductsResult.rows,
+        inventory_usage: inventoryUsageResult.rows,
       },
     });
   } catch (error) {

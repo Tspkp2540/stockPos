@@ -12,7 +12,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - บันทึกชื่อเล่น/เบอร์โทรของผู้ซื้อแบบไม่บังคับ เพื่อค้นหาออเดอร์ได้
 - หน้า public lookup ให้ลูกค้าหรือผู้ใช้ทั่วไปติดตามเฉพาะคิวออเดอร์ของวันปัจจุบัน หรือกรองด้วยเบอร์โทร
 - จัดการวัตถุดิบ, รับของเข้าสต็อก, เมนูสินค้า, สูตร BOM, ตัวเลือกเมนู (Modifier) และช่องทางขายพร้อมค่าธรรมเนียม
-- บันทึก/แก้ไข/ลบค่าใช้จ่าย สรุปการเงินตามวันที่ และรายงานยอดขายแยกตามช่องทาง/วิธีชำระเงิน
+- บันทึก/แก้ไข/ลบค่าใช้จ่าย สรุปการเงินตามวันที่ รายงานยอดขายแยกตามช่องทาง/วิธีชำระเงิน และรายงานช่วงเวลาเปรียบเทียบยอดขาย เมนูขายดี และวัตถุดิบที่ใช้จริง
 - ส่วนลดหน้าร้านและคูปอง โดยเก็บยอดก่อนลด ยอดลดแต่ละประเภท และยอดสุทธิในออเดอร์
 - ระบบสมาชิกผูกกับเบอร์โทร: ทุก 25 บาทรับ 1 แต้ม, ใช้ 10 แต้มลดได้ 1 บาท และย้อนแต้มอัตโนมัติเมื่อยกเลิกออเดอร์
 - รับชำระด้วยเงินสด, QR, โอน, บัตร หรืออื่น ๆ พร้อมยอดรับและเงินทอน
@@ -125,7 +125,7 @@ Authorization: Bearer <token>
 | สต็อก | `GET/POST/PUT/DELETE /api/inventory`, `POST /api/inventory/restock` | Admin |
 | เมนู/สูตร | `GET/POST/PUT/DELETE /api/products`, `PATCH /api/products/:id/availability` | Admin/Staff อ่าน, Admin จัดการ/ปิดขาย |
 | ช่องทางขาย | `GET/POST /api/channels`, `PUT /api/channels/:id` | Admin/Staff อ่าน, Admin จัดการ |
-| การเงิน | `GET /api/financial-summary`, `GET /api/sales-breakdown`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
+| การเงิน | `GET /api/financial-summary`, `GET /api/sales-breakdown`, `GET /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
 | คูปอง | `POST /api/coupons/validate`, `GET/POST/PUT /api/coupons` | Staff/Admin, Admin |
 | สมาชิก/แต้มสะสม | `POST /api/loyalty/lookup`, `GET /api/loyalty/me` | Staff/Admin ค้นหา, User ดูของตน |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
