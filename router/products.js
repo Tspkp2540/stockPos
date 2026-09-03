@@ -12,6 +12,31 @@ const normalizeBarcode = (value) => {
   return barcode || null;
 };
 
+const normalizeChannelSettings = (settings) => {
+  if (settings === undefined) return null;
+  if (!Array.isArray(settings)) throw new Error('Channel settings must be a list');
+  const seenChannels = new Set();
+  return settings.map((setting) => {
+    const channelId = Number(setting?.channel_id);
+    if (!Number.isInteger(channelId) || channelId <= 0 || seenChannels.has(channelId)) {
+      throw new Error('Channel setting data is invalid');
+    }
+    seenChannels.add(channelId);
+    const rawPrice = setting?.price_retail;
+    const priceRetail = rawPrice === '' || rawPrice === null || rawPrice === undefined
+      ? null
+      : Number(rawPrice);
+    if (priceRetail !== null && (!Number.isFinite(priceRetail) || priceRetail < 0)) {
+      throw new Error('Channel price is invalid');
+    }
+    return {
+      channelId,
+      isActive: setting?.is_active !== false,
+      priceRetail,
+    };
+  });
+};
+
 const normalizeModifiers = (modifiers = []) => {
   if (!Array.isArray(modifiers)) throw new Error('Modifiers must be a list');
   return modifiers.map((group, groupIndex) => {
@@ -51,6 +76,25 @@ const saveModifiers = async (client, productId, groups) => {
         [groupResult.rows[0].id, option.name, option.priceAdjustment, option.displayOrder]
       );
     }
+  }
+};
+
+const saveChannelSettings = async (client, productId, settings) => {
+  if (settings === null) return;
+  if (settings.length) {
+    const result = await client.query(
+      'SELECT id FROM channels WHERE id = ANY($1::bigint[])',
+      [settings.map((setting) => setting.channelId)],
+    );
+    if (result.rows.length !== settings.length) throw new Error('ไม่พบช่องทางขายที่เลือก');
+  }
+  await client.query('DELETE FROM product_channel_settings WHERE product_id = $1', [productId]);
+  for (const setting of settings) {
+    await client.query(
+      `INSERT INTO product_channel_settings (product_id, channel_id, is_active, price_retail)
+       VALUES ($1, $2, $3, $4)`,
+      [productId, setting.channelId, setting.isActive, setting.priceRetail],
+    );
   }
 };
 
@@ -94,6 +138,17 @@ router.get('/', async (req, res) => {
           FROM product_modifier_groups mg
           WHERE mg.product_id = p.id
         ), '[]'::json) AS modifier_groups,
+        COALESCE((
+          SELECT JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'channel_id', pcs.channel_id,
+              'is_active', pcs.is_active,
+              'price_retail', pcs.price_retail
+            ) ORDER BY pcs.channel_id
+          )
+          FROM product_channel_settings pcs
+          WHERE pcs.product_id = p.id
+        ), '[]'::json) AS channel_settings,
         CASE
           WHEN p.is_sold_out THEN FALSE
           WHEN NOT EXISTS (SELECT 1 FROM recipes tracked_recipe WHERE tracked_recipe.product_id = p.id) THEN TRUE
@@ -188,13 +243,15 @@ router.patch('/:id/availability', async (req, res) => {
 
 // 📌 POST /api/products - เพิ่มสินค้าใหม่
 router.post('/', async (req, res) => {
-  const { name, category, barcode, price_retail, price_wholesale, recipe = [], modifiers = [] } = req.body;
+  const { name, category, barcode, price_retail, price_wholesale, recipe = [], modifiers = [], channel_settings } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
   let normalizedModifiers;
+  let normalizedChannelSettings;
   try {
     normalizedModifiers = normalizeModifiers(modifiers);
+    normalizedChannelSettings = normalizeChannelSettings(channel_settings);
   } catch (error) {
     return res.status(400).json({ success: false, error: error.message });
   }
@@ -213,6 +270,7 @@ router.post('/', async (req, res) => {
       );
     }
     await saveModifiers(client, result.rows[0].id, normalizedModifiers);
+    await saveChannelSettings(client, result.rows[0].id, normalizedChannelSettings);
     await client.query('COMMIT');
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
@@ -226,13 +284,15 @@ router.post('/', async (req, res) => {
 
 // PUT /api/products/:id - แก้ไขเมนูและสูตรวัตถุดิบ
 router.put('/:id', async (req, res) => {
-  const { name, category, barcode, price_retail, price_wholesale, recipe = [], modifiers = [] } = req.body;
+  const { name, category, barcode, price_retail, price_wholesale, recipe = [], modifiers = [], channel_settings } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
   let normalizedModifiers;
+  let normalizedChannelSettings;
   try {
     normalizedModifiers = normalizeModifiers(modifiers);
+    normalizedChannelSettings = normalizeChannelSettings(channel_settings);
   } catch (error) {
     return res.status(400).json({ success: false, error: error.message });
   }
@@ -257,6 +317,7 @@ router.put('/:id', async (req, res) => {
       );
     }
     await saveModifiers(client, req.params.id, normalizedModifiers);
+    await saveChannelSettings(client, req.params.id, normalizedChannelSettings);
     await client.query('COMMIT');
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {

@@ -63,10 +63,69 @@ router.get('/lots', async (req, res) => {
 router.get('/suppliers', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, contact_name, phone, email, address, is_active, created_at, updated_at
-       FROM suppliers ORDER BY is_active DESC, name ASC`
+      `SELECT s.id, s.name, s.contact_name, s.phone, s.email, s.address, s.is_active, s.created_at, s.updated_at,
+              COALESCE((SELECT COUNT(*) FROM purchase_orders po WHERE po.supplier_id = s.id), 0) AS purchase_order_count,
+              COALESCE((SELECT COUNT(*) FROM stock_receipts sr WHERE sr.supplier_id = s.id), 0) AS receipt_count,
+              COALESCE((SELECT SUM(sr.total_amount) FROM stock_receipts sr WHERE sr.supplier_id = s.id), 0) AS total_purchased,
+              (SELECT MAX(sr.received_at) FROM stock_receipts sr WHERE sr.supplier_id = s.id) AS last_received_at
+       FROM suppliers s
+       ORDER BY s.is_active DESC, s.name ASC`
     );
     res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/suppliers/:id/history', async (req, res) => {
+  const supplierId = Number(req.params.id);
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 50, 1), 100);
+  if (!Number.isInteger(supplierId) || supplierId <= 0) {
+    return res.status(400).json({ success: false, error: 'รหัสผู้ขายไม่ถูกต้อง' });
+  }
+  try {
+    const supplierResult = await pool.query(
+      `SELECT s.id, s.name, s.contact_name, s.phone, s.email, s.address, s.is_active,
+              COALESCE((SELECT COUNT(*) FROM purchase_orders po WHERE po.supplier_id = s.id), 0) AS purchase_order_count,
+              COALESCE((SELECT COUNT(*) FROM stock_receipts sr WHERE sr.supplier_id = s.id), 0) AS receipt_count,
+              COALESCE((SELECT SUM(sr.total_amount) FROM stock_receipts sr WHERE sr.supplier_id = s.id), 0) AS total_purchased,
+              (SELECT MAX(sr.received_at) FROM stock_receipts sr WHERE sr.supplier_id = s.id) AS last_received_at
+       FROM suppliers s
+       WHERE s.id = $1`,
+      [supplierId],
+    );
+    if (!supplierResult.rows.length) return res.status(404).json({ success: false, error: 'ไม่พบผู้ขาย' });
+    const [purchaseOrders, receipts] = await Promise.all([
+      pool.query(
+        `SELECT po.id, po.po_no, po.status, po.expected_date, po.created_at, po.sent_at, po.received_at, po.cancelled_at,
+                COALESCE(SUM(poi.line_total), 0) AS total_amount,
+                COALESCE(COUNT(poi.id), 0) AS item_count
+         FROM purchase_orders po
+         LEFT JOIN purchase_order_items poi ON poi.purchase_order_id = po.id
+         WHERE po.supplier_id = $1
+         GROUP BY po.id
+         ORDER BY po.created_at DESC, po.id DESC
+         LIMIT $2`,
+        [supplierId, limit],
+      ),
+      pool.query(
+        `SELECT sr.id, sr.receipt_no, sr.purchase_order_id, sr.received_at, sr.note, sr.total_amount, sr.created_at,
+                COALESCE((SELECT COUNT(*) FROM stock_receipt_items sri WHERE sri.receipt_id = sr.id), 0) AS item_count
+         FROM stock_receipts sr
+         WHERE sr.supplier_id = $1
+         ORDER BY sr.received_at DESC, sr.id DESC
+         LIMIT $2`,
+        [supplierId, limit],
+      ),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        supplier: supplierResult.rows[0],
+        purchase_orders: purchaseOrders.rows,
+        receipts: receipts.rows,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }

@@ -212,6 +212,19 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS barcode VARCHAR(80)');
     await client.query('CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx ON products(barcode) WHERE barcode IS NOT NULL');
     await client.query(`
+      CREATE TABLE IF NOT EXISTS product_channel_settings (
+        product_id BIGINT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        channel_id BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        price_retail NUMERIC(12, 2),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (product_id, channel_id),
+        CHECK (price_retail IS NULL OR price_retail >= 0)
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS product_channel_settings_channel_idx ON product_channel_settings(channel_id, is_active)');
+    await client.query(`
       CREATE TABLE IF NOT EXISTS coupons (
         id BIGSERIAL PRIMARY KEY,
         code VARCHAR(64) NOT NULL UNIQUE,
@@ -1452,12 +1465,27 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
         throw requestError('Order item quantity and price are invalid');
       }
       const productResult = await client.query(
-        'SELECT id, name, is_sold_out FROM products WHERE id = $1 FOR KEY SHARE',
-        [item.product_id]
+        `SELECT p.id, p.name, p.is_sold_out, p.price_retail,
+                pcs.is_active AS channel_is_active, pcs.price_retail AS channel_price_retail
+         FROM products p
+         LEFT JOIN product_channel_settings pcs
+           ON pcs.product_id = p.id AND pcs.channel_id = $2
+         WHERE p.id = $1
+         FOR KEY SHARE OF p`,
+        [item.product_id, channel_id]
       );
       const product = productResult.rows[0];
       if (!product) throw requestError('Product not found', 404);
       if (product.is_sold_out) throw requestError(`${product.name} is temporarily unavailable`, 409);
+      if (product.channel_is_active === false) {
+        throw requestError(`${product.name} is not available for this sales channel`, 409);
+      }
+      const configuredPrice = product.channel_price_retail === null || product.channel_price_retail === undefined
+        ? Number(product.price_retail || 0)
+        : Number(product.channel_price_retail);
+      if (Math.abs(unitPrice - configuredPrice) > 0.005) {
+        throw requestError(`${product.name} price does not match this sales channel`, 409);
+      }
       const selectedModifiers = await resolveItemModifiers(client, item.product_id, item.modifiers);
       const modifierAdjustment = selectedModifiers.reduce(
         (sum, modifier) => sum + Number(modifier.price_adjustment || 0),
