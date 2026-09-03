@@ -7,6 +7,11 @@ const menuLowStockThreshold = Number.isInteger(configuredLowStockThreshold) && c
   ? configuredLowStockThreshold
   : 5;
 
+const normalizeBarcode = (value) => {
+  const barcode = String(value || '').trim().slice(0, 80);
+  return barcode || null;
+};
+
 const normalizeModifiers = (modifiers = []) => {
   if (!Array.isArray(modifiers)) throw new Error('Modifiers must be a list');
   return modifiers.map((group, groupIndex) => {
@@ -183,7 +188,7 @@ router.patch('/:id/availability', async (req, res) => {
 
 // 📌 POST /api/products - เพิ่มสินค้าใหม่
 router.post('/', async (req, res) => {
-  const { name, category, price_retail, price_wholesale, recipe = [], modifiers = [] } = req.body;
+  const { name, category, barcode, price_retail, price_wholesale, recipe = [], modifiers = [] } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
@@ -197,9 +202,9 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN');
     const result = await client.query(
-      `INSERT INTO products (name, category, price_retail, price_wholesale)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [name, category, price_retail, price_wholesale || null]
+      `INSERT INTO products (name, category, barcode, price_retail, price_wholesale)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [name, category, normalizeBarcode(barcode), price_retail, price_wholesale || null]
     );
     for (const ingredient of recipe) {
       await client.query(
@@ -212,6 +217,7 @@ router.post('/', async (req, res) => {
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'Barcode already exists' });
     res.status(500).json({ success: false, error: error.message });
   } finally {
     client.release();
@@ -220,7 +226,7 @@ router.post('/', async (req, res) => {
 
 // PUT /api/products/:id - แก้ไขเมนูและสูตรวัตถุดิบ
 router.put('/:id', async (req, res) => {
-  const { name, category, price_retail, price_wholesale, recipe = [], modifiers = [] } = req.body;
+  const { name, category, barcode, price_retail, price_wholesale, recipe = [], modifiers = [] } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
@@ -234,9 +240,9 @@ router.put('/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     const result = await client.query(
-      `UPDATE products SET name = $1, category = $2, price_retail = $3, price_wholesale = $4
-       WHERE id = $5 RETURNING *`,
-      [name, category, price_retail, price_wholesale || null, req.params.id]
+      `UPDATE products SET name = $1, category = $2, barcode = $3, price_retail = $4, price_wholesale = $5
+       WHERE id = $6 RETURNING *`,
+      [name, category, normalizeBarcode(barcode), price_retail, price_wholesale || null, req.params.id]
     );
     if (!result.rows.length) {
       await client.query('ROLLBACK');
@@ -255,6 +261,7 @@ router.put('/:id', async (req, res) => {
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'Barcode already exists' });
     res.status(500).json({ success: false, error: error.message });
   } finally {
     client.release();

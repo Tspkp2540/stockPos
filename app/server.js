@@ -209,6 +209,8 @@ const startServer = async () => {
     await client.query('CREATE INDEX IF NOT EXISTS loyalty_transactions_account_created_idx ON loyalty_transactions(loyalty_account_id, created_at DESC)');
     await client.query('CREATE INDEX IF NOT EXISTS orders_loyalty_account_idx ON orders(loyalty_account_id)');
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS is_sold_out BOOLEAN NOT NULL DEFAULT FALSE');
+    await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS barcode VARCHAR(80)');
+    await client.query('CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx ON products(barcode) WHERE barcode IS NOT NULL');
     await client.query(`
       CREATE TABLE IF NOT EXISTS coupons (
         id BIGSERIAL PRIMARY KEY,
