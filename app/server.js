@@ -21,10 +21,28 @@ const isValidRecordDate = (value) => {
 };
 
 const selectedRecordDate = (value) => isValidRecordDate(value) ? value : null;
+const bangkokToday = () => {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const value = (type) => parts.find((part) => part.type === type)?.value;
+  return `${value('year')}-${value('month')}-${value('day')}`;
+};
 const shiftRecordDate = (value, days) => {
   const date = new Date(`${value}T00:00:00.000Z`);
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
+};
+const assertBusinessDateOpen = async (client, recordDate = null) => {
+  const result = await client.query(
+    `SELECT id FROM daily_closings
+     WHERE business_date = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)
+     LIMIT 1`,
+    [recordDate]
+  );
+  if (result.rows.length) {
+    throw requestError('วันทำการนี้ถูกปิดยอดแล้ว ไม่สามารถแก้ไขได้', 409);
+  }
 };
 const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
 const isValidPhone = (value) => /^\d{9,15}$/.test(value);
@@ -415,6 +433,24 @@ const startServer = async () => {
       )
     `);
     await client.query('ALTER TABLE expenses ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT \'\'');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS daily_closings (
+        id BIGSERIAL PRIMARY KEY,
+        business_date DATE NOT NULL UNIQUE,
+        closed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        closed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        order_count INTEGER NOT NULL DEFAULT 0,
+        gross_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        net_revenue NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        total_cogs NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        gross_profit NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        discount_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        expenses NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        operating_profit NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT ''
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS daily_closings_date_idx ON daily_closings(business_date DESC)');
     client.release();
     console.log('⚡ Connected to PostgreSQL ดDatabase Successfully!');
 
@@ -737,7 +773,7 @@ app.post('/api/public/orders/lookup', async (req, res) => {
     );
     res.json({ success: true, data: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -1159,6 +1195,96 @@ app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, 
   }
 });
 
+// 📒 GET /api/daily-closings?date=YYYY-MM-DD - สถานะปิดยอดของวันนั้น
+app.get('/api/daily-closings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const businessDate = selectedRecordDate(req.query?.date);
+  if (!businessDate) return res.status(400).json({ success: false, error: 'Please provide a valid business date' });
+  try {
+    const result = await pool.query(
+      `SELECT dc.*, u.full_name AS closed_by_name
+       FROM daily_closings dc
+       LEFT JOIN users u ON u.id = dc.closed_by
+       WHERE dc.business_date = $1::date`,
+      [businessDate]
+    );
+    res.json({ success: true, data: result.rows[0] || null });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 📒 POST /api/daily-closings - ปิดยอดและเก็บ snapshot รายวัน
+app.post('/api/daily-closings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const businessDate = selectedRecordDate(req.body?.business_date);
+  const note = String(req.body?.note || '').trim().slice(0, 1000);
+  if (!businessDate || businessDate > bangkokToday()) {
+    return res.status(400).json({ success: false, error: 'Business date must not be in the future' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const openShift = await client.query(
+      `SELECT id FROM cash_shifts
+       WHERE status = 'OPEN'
+         AND DATE(opened_at AT TIME ZONE 'Asia/Bangkok') = $1::date
+       LIMIT 1`,
+      [businessDate]
+    );
+    if (openShift.rows.length) {
+      throw requestError('กรุณาปิดกะเงินสดที่เปิดอยู่ก่อนปิดยอดประจำวัน', 409);
+    }
+    const orderSummary = await client.query(
+      `SELECT COUNT(id)::int AS order_count,
+              COALESCE(SUM(gross_amount), 0) AS gross_amount,
+              COALESCE(SUM(net_revenue), 0) AS net_revenue,
+              COALESCE(SUM(total_cogs), 0) AS total_cogs,
+              COALESCE(SUM(net_profit), 0) AS gross_profit,
+              COALESCE(SUM(manual_discount_amount), 0) + COALESCE(SUM(coupon_discount_amount), 0) + COALESCE(SUM(loyalty_discount_amount), 0) AS discount_amount
+       FROM orders
+       WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = $1::date
+         AND status <> 'CANCELLED'`,
+      [businessDate]
+    );
+    const expenseSummary = await client.query(
+      `SELECT COALESCE(SUM(amount), 0) AS expenses
+       FROM expenses
+       WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = $1::date`,
+      [businessDate]
+    );
+    const totals = orderSummary.rows[0] || {};
+    const expenses = Number(expenseSummary.rows[0]?.expenses || 0);
+    const grossProfit = Number(totals.gross_profit || 0);
+    const result = await client.query(
+      `INSERT INTO daily_closings
+       (business_date, closed_by, order_count, gross_amount, net_revenue, total_cogs, gross_profit, discount_amount, expenses, operating_profit, note)
+       VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [
+        businessDate,
+        req.user.sub,
+        Number(totals.order_count || 0),
+        Number(totals.gross_amount || 0),
+        Number(totals.net_revenue || 0),
+        Number(totals.total_cogs || 0),
+        grossProfit,
+        Number(totals.discount_amount || 0),
+        expenses,
+        grossProfit - expenses,
+        note,
+      ]
+    );
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    const status = error.code === '23505' ? 409 : error.statusCode || 500;
+    const message = error.code === '23505' ? 'วันทำการนี้ถูกปิดยอดแล้ว' : error.message;
+    res.status(status).json({ success: false, error: message });
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/expenses - บันทึกค่าใช้จ่ายประจำวัน
 app.post('/api/expenses', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   const amount = Number(req.body?.amount);
@@ -1171,6 +1297,7 @@ app.post('/api/expenses', requireAuth, requireRoles('ADMIN'), async (req, res) =
   }
 
   try {
+    await assertBusinessDateOpen(pool, recordDate);
     const result = await pool.query(
       `INSERT INTO expenses (amount, category, description, created_at)
        VALUES ($1, $2, $3, COALESCE($4::date::timestamp AT TIME ZONE 'Asia/Bangkok', CURRENT_TIMESTAMP))
@@ -1179,7 +1306,7 @@ app.post('/api/expenses', requireAuth, requireRoles('ADMIN'), async (req, res) =
     );
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -1203,6 +1330,16 @@ app.put('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, res
     return res.status(400).json({ success: false, error: 'Invalid expense payload' });
   }
   try {
+    const existing = await pool.query(
+      `SELECT DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date
+       FROM expenses WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
+    await assertBusinessDateOpen(pool, existing.rows[0].business_date);
+    if (recordDate && recordDate !== existing.rows[0].business_date) {
+      await assertBusinessDateOpen(pool, recordDate);
+    }
     const result = await pool.query(
       `UPDATE expenses
        SET amount = $1, category = $2, description = $3,
@@ -1210,21 +1347,26 @@ app.put('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, res
        WHERE id = $5 RETURNING *`,
       [amount, category, description, recordDate, req.params.id]
     );
-    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 
 // DELETE /api/expenses/:id - ลบรายการค่าใช้จ่าย
 app.delete('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   try {
+    const existing = await pool.query(
+      `SELECT DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date
+       FROM expenses WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
+    await assertBusinessDateOpen(pool, existing.rows[0].business_date);
     const result = await pool.query('DELETE FROM expenses WHERE id = $1 RETURNING id', [req.params.id]);
-    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -1265,6 +1407,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
   try {
     // เริ่มต้น Database Transaction
     await client.query('BEGIN');
+    await assertBusinessDateOpen(client, recordDate);
 
     // 1. ดึงข้อมูลช่องทางขาย (% GP)
     const channelRes = await client.query('SELECT name, gp_percent FROM channels WHERE id = $1 AND is_active = TRUE', [channel_id]);
@@ -1566,12 +1709,17 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
   try {
     await client.query('BEGIN');
     const orderResult = await client.query(
-      `SELECT id, status, manual_discount_amount, coupon_discount_amount,
+      `SELECT id, status, DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date,
+              manual_discount_amount, coupon_discount_amount,
               loyalty_points_earned, loyalty_points_redeemed, loyalty_discount_amount
        FROM orders WHERE id = $1 FOR UPDATE`,
       [id]
     );
     if (!orderResult.rows.length) throw new Error('Order not found');
+    await assertBusinessDateOpen(client, orderResult.rows[0].business_date);
+    if (recordDate && recordDate !== orderResult.rows[0].business_date) {
+      await assertBusinessDateOpen(client, recordDate);
+    }
     if (orderResult.rows[0].status === 'CANCELLED') throw new Error('Cancelled sales records cannot be edited');
     if (Number(orderResult.rows[0].loyalty_points_earned || 0) || Number(orderResult.rows[0].loyalty_points_redeemed || 0)) {
       throw new Error('Loyalty-linked orders cannot be edited. Cancel and create a replacement order instead.');
@@ -1697,7 +1845,7 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (r
     res.json({ success: true, data: updated.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(error.message === 'Order not found' ? 404 : 400).json({ success: false, error: error.message });
+    res.status(error.message === 'Order not found' ? 404 : error.statusCode || 400).json({ success: false, error: error.message });
   } finally {
     client.release();
   }
@@ -1710,11 +1858,13 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
   try {
     await client.query('BEGIN');
     const orderResult = await client.query(
-      `SELECT id, status, loyalty_account_id, loyalty_points_earned, loyalty_points_redeemed
+      `SELECT id, status, DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date,
+              loyalty_account_id, loyalty_points_earned, loyalty_points_redeemed
        FROM orders WHERE id = $1 FOR UPDATE`,
       [id]
     );
     if (!orderResult.rows.length) throw new Error('Order not found');
+    await assertBusinessDateOpen(client, orderResult.rows[0].business_date);
     if (orderResult.rows[0].status !== 'CANCELLED') {
       const previousIngredients = await client.query(
         `SELECT r.ingredient_id, SUM(r.quantity_used * oi.quantity) AS quantity_to_restore,
@@ -1767,7 +1917,7 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
     res.json({ success: true, data: { id: Number(id) } });
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(error.message === 'Order not found' ? 404 : 400).json({ success: false, error: error.message });
+    res.status(error.message === 'Order not found' ? 404 : error.statusCode || 400).json({ success: false, error: error.message });
   } finally {
     client.release();
   }
@@ -1784,6 +1934,15 @@ app.put('/api/orders/:id/status', requireAuth, requireRoles('ADMIN', 'STAFF'), a
   }
 
   try {
+    const current = await pool.query(
+      `SELECT DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date
+       FROM orders WHERE id = $1`,
+      [id]
+    );
+    if (!current.rows.length) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+    await assertBusinessDateOpen(pool, current.rows[0].business_date);
     const result = await pool.query(
       `UPDATE orders SET status = $1 WHERE id = $2 RETURNING *`,
       [status, id]
@@ -1804,7 +1963,7 @@ app.put('/api/orders/:id/status', requireAuth, requireRoles('ADMIN', 'STAFF'), a
 
     res.json({ success: true, data: updatedOrder });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 

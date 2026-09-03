@@ -4,6 +4,18 @@ const pool = require('../config/db');
 const { requireRoles } = require('../middleware/auth');
 const { addInventoryLot, restoreOrderLots } = require('../utils/inventoryLots');
 
+const assertBusinessDateOpen = async (client, businessDate) => {
+  const result = await client.query(
+    `SELECT id FROM daily_closings
+     WHERE business_date = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)
+     LIMIT 1`,
+    [businessDate]
+  );
+  if (result.rows.length) {
+    throw Object.assign(new Error('วันทำการนี้ถูกปิดยอดแล้ว ไม่สามารถแก้ไขได้'), { statusCode: 409 });
+  }
+};
+
 // POST /api/orders - รับออเดอร์ใหม่
 router.post('/orders', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   const { order_no, channel_id, items } = req.body;
@@ -14,6 +26,7 @@ router.post('/orders', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   try {
     // 1. เริ่ม Transaction
     await client.query('BEGIN');
+    await assertBusinessDateOpen(client);
 
     // 2. ดึง % GP ของช่องทางขาย
     const channelRes = await client.query('SELECT gp_percent FROM channels WHERE id = $1', [channel_id]);
@@ -127,7 +140,8 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
 
     // 1. ตรวจสอบสถานะออเดอร์
     const orderRes = await client.query(
-      `SELECT id, status, loyalty_account_id, loyalty_points_earned, loyalty_points_redeemed,
+      `SELECT id, status, DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date,
+              loyalty_account_id, loyalty_points_earned, loyalty_points_redeemed,
               loyalty_discount_amount
        FROM orders WHERE id = $1 FOR UPDATE`,
       [id]
@@ -135,6 +149,7 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
     if (orderRes.rows.length === 0) {
       throw new Error('Order not found');
     }
+    await assertBusinessDateOpen(client, orderRes.rows[0].business_date);
 
     if (orderRes.rows[0].status === 'CANCELLED') {
       throw new Error('Order is already cancelled');
@@ -228,7 +243,7 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(400).json({ success: false, error: error.message });
+    res.status(error.statusCode || 400).json({ success: false, error: error.message });
   } finally {
     client.release();
   }
