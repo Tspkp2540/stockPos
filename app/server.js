@@ -930,6 +930,9 @@ app.post('/api/shifts/:id/close', requireAuth, requireRoles('ADMIN', 'STAFF'), a
     const cashSales = Number(cashResult.rows[0].cash_sales || 0);
     const expectedCash = Number(shift.opening_cash || 0) + cashSales;
     const differenceAmount = closingCash - expectedCash;
+    if (Math.abs(differenceAmount) >= 0.005 && !closingNote) {
+      throw requestError('กรุณาระบุเหตุผลของยอดเงินที่ต่างก่อนปิดกะ', 400);
+    }
     const updated = await client.query(
       `UPDATE cash_shifts
        SET status = 'CLOSED', closed_by = $1, closed_at = CURRENT_TIMESTAMP,
