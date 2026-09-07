@@ -8,6 +8,7 @@ const { hashPassword, verifyPassword, needsPasswordUpgrade, createToken, verifyT
 
 const app = express();
 const server = http.createServer(app);
+const serverStartedAt = Date.now();
 const ordersRouter = require('../router/orders');
 const inventoryRouter = require('../router/inventory');
 const productsRouter = require('../router/products');
@@ -68,6 +69,46 @@ const loyaltyAccountPayload = (account) => account ? ({
   lifetime_spend: Number(account.lifetime_spend || 0),
   updated_at: account.updated_at,
 }) : null;
+const auditSensitiveFields = new Set(['password', 'password_hash', 'token', 'authorization', 'access_token', 'refresh_token']);
+const auditPayload = (value, depth = 0) => {
+  if (depth > 3) return '[truncated]';
+  if (value === null || value === undefined || typeof value === 'boolean' || typeof value === 'number') return value;
+  if (typeof value === 'string') return value.length > 300 ? `${value.slice(0, 300)}…` : value;
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => auditPayload(item, depth + 1));
+  if (typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).slice(0, 30).map(([key, item]) => [
+      key,
+      auditSensitiveFields.has(String(key).toLowerCase()) ? '[redacted]' : auditPayload(item, depth + 1),
+    ]));
+  }
+  return String(value);
+};
+const shouldAuditRequest = (req) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) || !req.user) return false;
+  const ignoredPaths = new Set(['/api/auth/login', '/api/auth/register', '/api/coupons/validate', '/api/loyalty/lookup']);
+  return req.path.startsWith('/api/') && !ignoredPaths.has(req.path);
+};
+const recordAuditLog = (req, statusCode) => {
+  if (!shouldAuditRequest(req)) return;
+  const pathParts = req.path.replace(/^\/api\//, '').split('/').filter(Boolean);
+  const resourceId = pathParts.find((part) => /^\d+$/.test(part)) || null;
+  pool.query(
+    `INSERT INTO audit_logs
+     (actor_user_id, actor_username, actor_role, action, resource, resource_id, request_summary, status_code, ip_address)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)`,
+    [
+      req.user.sub,
+      req.user.username || '',
+      req.user.role || '',
+      req.method,
+      pathParts.slice(0, 2).join('/') || req.path,
+      resourceId,
+      JSON.stringify(auditPayload(req.body || {})),
+      statusCode,
+      String(req.ip || '').slice(0, 100),
+    ],
+  ).catch((error) => console.warn('Audit log write failed.', error.message));
+};
 const paymentMethods = new Set(['CASH', 'QR', 'TRANSFER', 'CARD', 'OTHER']);
 const normalizePaymentMethod = (value) => {
   const method = String(value || 'OTHER').trim().toUpperCase();
@@ -466,6 +507,32 @@ const startServer = async () => {
       )
     `);
     await client.query('CREATE INDEX IF NOT EXISTS daily_closings_date_idx ON daily_closings(business_date DESC)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id BIGSERIAL PRIMARY KEY,
+        actor_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        actor_username VARCHAR(64) NOT NULL DEFAULT '',
+        actor_role VARCHAR(16) NOT NULL DEFAULT '',
+        action VARCHAR(12) NOT NULL,
+        resource VARCHAR(160) NOT NULL,
+        resource_id VARCHAR(80),
+        request_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status_code INTEGER NOT NULL,
+        ip_address VARCHAR(100) NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx ON audit_logs(created_at DESC)');
+    await client.query('CREATE INDEX IF NOT EXISTS audit_logs_actor_idx ON audit_logs(actor_user_id, created_at DESC)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS go_live_checks (
+        check_key VARCHAR(80) PRIMARY KEY,
+        status VARCHAR(16) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PASSED', 'BLOCKED')),
+        note VARCHAR(1000) NOT NULL DEFAULT '',
+        checked_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
     client.release();
     console.log('⚡ Connected to PostgreSQL ดDatabase Successfully!');
 
@@ -494,6 +561,35 @@ app.use('/api', (req, res, next) => {
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.set('Surrogate-Control', 'no-store');
+  next();
+});
+
+// GET /api/health - ตรวจสถานะ API และการเชื่อมต่อฐานข้อมูลสำหรับหน้าร้าน
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1 AS database_ok');
+    res.json({
+      success: true,
+      data: {
+        api: 'ok',
+        database: 'ok',
+        uptime_seconds: Math.floor((Date.now() - serverStartedAt) / 1000),
+        checked_at: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    res.status(503).json({
+      success: false,
+      data: { api: 'ok', database: 'unavailable', checked_at: new Date().toISOString() },
+      error: 'Database is unavailable',
+    });
+  }
+});
+
+app.use('/api', (req, res, next) => {
+  res.on('finish', () => {
+    if (res.statusCode < 500) recordAuditLog(req, res.statusCode);
+  });
   next();
 });
 
@@ -548,6 +644,156 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     const result = await pool.query('SELECT id, username, full_name, phone, role FROM users WHERE id = $1', [req.user.sub]);
     if (!result.rows.length) return res.status(401).json({ success: false, error: 'Session is no longer valid' });
     res.json({ success: true, data: publicUser(result.rows[0]) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+const goLiveCheckKeys = new Set([
+  'database_backup',
+  'audit_log_review',
+  'admin_access',
+  'staff_access',
+  'user_access',
+  'sales_flow',
+  'print_flow',
+]);
+
+// GET /api/admin/go-live/readiness - สถานะข้อมูลที่ต้องตรวจสอบก่อนเปิดใช้จริง
+app.get('/api/admin/go-live/readiness', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const [rolesResult, channelResult, productResult, inventoryResult, shiftResult, backupResult] = await Promise.all([
+      pool.query(`SELECT role, COUNT(*)::int AS count FROM users GROUP BY role ORDER BY role ASC`),
+      pool.query(`SELECT COUNT(*)::int AS active_channels FROM channels WHERE is_active = TRUE`),
+      pool.query(`SELECT COUNT(*)::int AS active_products FROM products WHERE is_sold_out = FALSE`),
+      pool.query(`SELECT COUNT(*)::int AS low_stock_count FROM ingredients WHERE stock_qty <= min_stock_alert`),
+      pool.query(`SELECT COUNT(*)::int AS open_shift_count FROM cash_shifts WHERE status = 'OPEN'`),
+      pool.query(`SELECT MAX(created_at) AS last_backup_at FROM audit_logs WHERE action = 'EXPORT' AND resource = 'admin/backups'`),
+    ]);
+    const roleCounts = Object.fromEntries(rolesResult.rows.map((row) => [String(row.role || '').toLowerCase(), Number(row.count || 0)]));
+    res.json({
+      success: true,
+      data: {
+        role_counts: roleCounts,
+        active_channels: Number(channelResult.rows[0]?.active_channels || 0),
+        active_products: Number(productResult.rows[0]?.active_products || 0),
+        low_stock_count: Number(inventoryResult.rows[0]?.low_stock_count || 0),
+        open_shift_count: Number(shiftResult.rows[0]?.open_shift_count || 0),
+        last_backup_at: backupResult.rows[0]?.last_backup_at || null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/admin/backups/export - ส่งออก snapshot ข้อมูลธุรกิจแบบ JSON (ไม่ส่งออก password hash)
+app.get('/api/admin/backups/export', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const backupQueries = {
+    users: `SELECT id, username, full_name, role, phone, created_at FROM users ORDER BY id`,
+    channels: `SELECT * FROM channels ORDER BY id`,
+    ingredients: `SELECT * FROM ingredients ORDER BY id`,
+    inventory_lots: `SELECT * FROM inventory_lots ORDER BY id`,
+    products: `SELECT * FROM products ORDER BY id`,
+    product_channel_settings: `SELECT * FROM product_channel_settings ORDER BY product_id, channel_id`,
+    recipes: `SELECT * FROM recipes ORDER BY id`,
+    product_modifier_groups: `SELECT * FROM product_modifier_groups ORDER BY id`,
+    product_modifier_options: `SELECT * FROM product_modifier_options ORDER BY id`,
+    suppliers: `SELECT * FROM suppliers ORDER BY id`,
+    purchase_orders: `SELECT * FROM purchase_orders ORDER BY id`,
+    purchase_order_items: `SELECT * FROM purchase_order_items ORDER BY id`,
+    stock_receipts: `SELECT * FROM stock_receipts ORDER BY id`,
+    stock_receipt_items: `SELECT * FROM stock_receipt_items ORDER BY id`,
+    inventory_movements: `SELECT * FROM inventory_movements ORDER BY id`,
+    orders: `SELECT * FROM orders ORDER BY id`,
+    order_items: `SELECT * FROM order_items ORDER BY id`,
+    order_item_modifiers: `SELECT * FROM order_item_modifiers ORDER BY id`,
+    order_item_lot_allocations: `SELECT * FROM order_item_lot_allocations ORDER BY id`,
+    order_payments: `SELECT * FROM order_payments ORDER BY id`,
+    coupons: `SELECT * FROM coupons ORDER BY id`,
+    expenses: `SELECT * FROM expenses ORDER BY id`,
+    cash_shifts: `SELECT * FROM cash_shifts ORDER BY id`,
+    daily_closings: `SELECT * FROM daily_closings ORDER BY id`,
+    loyalty_accounts: `SELECT * FROM loyalty_accounts ORDER BY id`,
+    loyalty_transactions: `SELECT * FROM loyalty_transactions ORDER BY id`,
+    audit_logs: `SELECT * FROM audit_logs ORDER BY id`,
+    go_live_checks: `SELECT * FROM go_live_checks ORDER BY check_key`,
+  };
+  try {
+    const result = await Promise.all(Object.entries(backupQueries).map(async ([name, query]) => {
+      const rows = await pool.query(query);
+      return [name, rows.rows];
+    }));
+    const generatedAt = new Date();
+    await pool.query(
+      `INSERT INTO audit_logs
+       (actor_user_id, actor_username, actor_role, action, resource, request_summary, status_code, ip_address)
+       VALUES ($1, $2, $3, 'EXPORT', 'admin/backups', $4::jsonb, 200, $5)`,
+      [req.user.sub, req.user.username || '', req.user.role || '', JSON.stringify({ table_count: result.length }), String(req.ip || '').slice(0, 100)],
+    );
+    const stamp = generatedAt.toISOString().replace(/[:.]/g, '-');
+    res.attachment(`stockpos-business-backup-${stamp}.json`).json({
+      backup_format: 'stockpos-business-data-v1',
+      generated_at: generatedAt.toISOString(),
+      generated_by: { id: req.user.sub, username: req.user.username, role: req.user.role },
+      note: 'Snapshot excludes password hashes. Keep it encrypted and use a database-provider backup or pg_dump for a full infrastructure restore.',
+      tables: Object.fromEntries(result),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/admin/audit-logs - ประวัติการแก้ไขและการทำรายการสำคัญ
+app.get('/api/admin/audit-logs', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query?.limit) || 30));
+  try {
+    const result = await pool.query(
+      `SELECT al.*, COALESCE(u.full_name, NULLIF(al.actor_username, ''), 'ระบบ') AS actor_name
+       FROM audit_logs al
+       LEFT JOIN users u ON u.id = al.actor_user_id
+       ORDER BY al.created_at DESC, al.id DESC
+       LIMIT $1`,
+      [limit],
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET/PUT /api/admin/go-live-checks - เก็บผลการตรวจรับก่อนเปิดใช้งาน
+app.get('/api/admin/go-live-checks', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT glc.*, COALESCE(u.full_name, u.username, 'ผู้ดูแลระบบ') AS checked_by_name
+       FROM go_live_checks glc
+       LEFT JOIN users u ON u.id = glc.checked_by
+       ORDER BY glc.check_key ASC`,
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/admin/go-live-checks/:key', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const checkKey = String(req.params.key || '').trim();
+  const status = String(req.body?.status || 'PENDING').trim().toUpperCase();
+  const note = String(req.body?.note || '').trim().slice(0, 1000);
+  if (!goLiveCheckKeys.has(checkKey) || !['PENDING', 'PASSED', 'BLOCKED'].includes(status)) {
+    return res.status(400).json({ success: false, error: 'Invalid readiness check' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO go_live_checks (check_key, status, note, checked_by, updated_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (check_key) DO UPDATE
+         SET status = EXCLUDED.status, note = EXCLUDED.note, checked_by = EXCLUDED.checked_by, updated_at = CURRENT_TIMESTAMP
+       RETURNING *`,
+      [checkKey, status, note, req.user.sub],
+    );
+    res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1127,17 +1373,19 @@ app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, 
   const expenseDateFilter = "DATE(e.created_at AT TIME ZONE 'Asia/Bangkok') BETWEEN $1::date AND $2::date";
   const summaryQuery = `
     SELECT COUNT(o.id)::int AS order_count,
+           COALESCE(SUM(o.subtotal_amount), 0) AS subtotal_amount,
            COALESCE(SUM(o.gross_amount), 0) AS gross_amount,
+           COALESCE(SUM(o.gp_amount), 0) AS gp_amount,
            COALESCE(SUM(o.net_revenue), 0) AS net_revenue,
            COALESCE(SUM(o.total_cogs), 0) AS total_cogs,
-           COALESCE(SUM(o.net_profit), 0) AS gross_profit,
+           COALESCE(SUM(o.net_profit), 0) AS net_profit,
            COALESCE(SUM(o.manual_discount_amount), 0) + COALESCE(SUM(o.coupon_discount_amount), 0) + COALESCE(SUM(o.loyalty_discount_amount), 0) AS discount_amount
     FROM orders o
     WHERE ${dateFilter} AND o.status <> 'CANCELLED'`;
   const expensesQuery = `SELECT COALESCE(SUM(e.amount), 0) AS expenses FROM expenses e WHERE ${expenseDateFilter}`;
 
   try {
-    const [summaryResult, previousSummaryResult, expenseResult, previousExpenseResult, dailyResult, topProductsResult, inventoryUsageResult] = await Promise.all([
+    const [summaryResult, previousSummaryResult, expenseResult, previousExpenseResult, dailyResult, productMetricsResult, channelMetricsResult, hourlySalesResult, inventoryUsageResult] = await Promise.all([
       pool.query(summaryQuery, [from, to]),
       pool.query(summaryQuery, [previousFrom, previousTo]),
       pool.query(expensesQuery, [from, to]),
@@ -1156,15 +1404,60 @@ app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, 
       pool.query(
         `SELECT p.id AS product_id, COALESCE(p.name, 'เมนูที่ถูกลบ') AS product_name,
                 COALESCE(SUM(oi.quantity), 0) AS quantity_sold,
-                COALESCE(SUM(oi.subtotal), 0) AS sales_amount,
-                COUNT(DISTINCT o.id)::int AS order_count
+                COUNT(DISTINCT o.id)::int AS order_count,
+                COALESCE(SUM(oi.subtotal), 0) AS list_sales_amount,
+                COALESCE(SUM(oi.subtotal * COALESCE(o.discount_amount / NULLIF(o.subtotal_amount, 0), 0)), 0) AS discount_amount,
+                COALESCE(SUM(oi.subtotal * COALESCE(o.gp_amount / NULLIF(o.subtotal_amount, 0), 0)), 0) AS gp_amount,
+                COALESCE(SUM(oi.subtotal * COALESCE(o.net_revenue / NULLIF(o.subtotal_amount, 0), 0)), 0) AS net_revenue,
+                COALESCE(SUM(CASE
+                  WHEN item_cogs.order_item_id IS NULL THEN COALESCE(o.total_cogs, 0) * COALESCE(oi.subtotal / NULLIF(o.subtotal_amount, 0), 0)
+                  ELSE item_cogs.total_cogs
+                END), 0) AS total_cogs,
+                COALESCE(SUM(oi.subtotal * COALESCE(o.net_revenue / NULLIF(o.subtotal_amount, 0), 0) - CASE
+                  WHEN item_cogs.order_item_id IS NULL THEN COALESCE(o.total_cogs, 0) * COALESCE(oi.subtotal / NULLIF(o.subtotal_amount, 0), 0)
+                  ELSE item_cogs.total_cogs
+                END), 0) AS net_profit
          FROM orders o
          JOIN order_items oi ON oi.order_id = o.id
          LEFT JOIN products p ON p.id = oi.product_id
+         LEFT JOIN (
+           SELECT order_item_id, SUM(quantity * unit_cost) AS total_cogs
+           FROM order_item_lot_allocations
+           GROUP BY order_item_id
+         ) item_cogs ON item_cogs.order_item_id = oi.id
          WHERE ${dateFilter} AND o.status <> 'CANCELLED'
          GROUP BY p.id, p.name
-         ORDER BY quantity_sold DESC, sales_amount DESC, product_name ASC
-         LIMIT 5`,
+         ORDER BY net_revenue DESC, quantity_sold DESC, product_name ASC
+         LIMIT 100`,
+        [from, to]
+      ),
+      pool.query(
+        `SELECT COALESCE(c.name, 'ไม่ระบุช่องทาง') AS channel_name,
+                COUNT(o.id)::int AS order_count,
+                COALESCE(SUM(o.subtotal_amount), 0) AS subtotal_amount,
+                COALESCE(SUM(o.discount_amount), 0) AS discount_amount,
+                COALESCE(SUM(o.gross_amount), 0) AS gross_amount,
+                COALESCE(SUM(o.gp_amount), 0) AS gp_amount,
+                COALESCE(SUM(o.net_revenue), 0) AS net_revenue,
+                COALESCE(SUM(o.total_cogs), 0) AS total_cogs,
+                COALESCE(SUM(o.net_profit), 0) AS net_profit
+         FROM orders o
+         LEFT JOIN channels c ON c.id = o.channel_id
+         WHERE ${dateFilter} AND o.status <> 'CANCELLED'
+         GROUP BY c.id, c.name
+         ORDER BY net_revenue DESC, channel_name ASC`,
+        [from, to]
+      ),
+      pool.query(
+        `SELECT EXTRACT(HOUR FROM o.created_at AT TIME ZONE 'Asia/Bangkok')::int AS hour,
+                COUNT(o.id)::int AS order_count,
+                COALESCE(SUM(o.gross_amount), 0) AS gross_amount,
+                COALESCE(SUM(o.net_revenue), 0) AS net_revenue,
+                COALESCE(SUM(o.net_profit), 0) AS net_profit
+         FROM orders o
+         WHERE ${dateFilter} AND o.status <> 'CANCELLED'
+         GROUP BY EXTRACT(HOUR FROM o.created_at AT TIME ZONE 'Asia/Bangkok')
+         ORDER BY hour ASC`,
         [from, to]
       ),
       pool.query(
@@ -1184,17 +1477,20 @@ app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, 
       ),
     ]);
     const formatSummary = (summary, expenses) => {
-      const grossProfit = Number(summary.gross_profit || 0);
+      const netProfit = Number(summary.net_profit || 0);
       const expenseTotal = Number(expenses.expenses || 0);
       return {
         order_count: Number(summary.order_count || 0),
+        subtotal_amount: Number(summary.subtotal_amount || 0),
         gross_amount: Number(summary.gross_amount || 0),
+        gp_amount: Number(summary.gp_amount || 0),
         net_revenue: Number(summary.net_revenue || 0),
         total_cogs: Number(summary.total_cogs || 0),
-        gross_profit: grossProfit,
+        gross_profit: netProfit,
+        net_profit: netProfit,
         discount_amount: Number(summary.discount_amount || 0),
         expenses: expenseTotal,
-        operating_profit: grossProfit - expenseTotal,
+        operating_profit: netProfit - expenseTotal,
       };
     };
     res.json({
@@ -1204,7 +1500,10 @@ app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, 
         summary: formatSummary(summaryResult.rows[0] || {}, expenseResult.rows[0] || {}),
         previous_summary: formatSummary(previousSummaryResult.rows[0] || {}, previousExpenseResult.rows[0] || {}),
         daily: dailyResult.rows,
-        top_products: topProductsResult.rows,
+        top_products: productMetricsResult.rows.slice(0, 5),
+        product_metrics: productMetricsResult.rows,
+        channel_metrics: channelMetricsResult.rows,
+        hourly_sales: hourlySalesResult.rows,
         inventory_usage: inventoryUsageResult.rows,
       },
     });
