@@ -23,6 +23,9 @@ const localFrontendOrigins = new Set([
   'http://127.0.0.1:3001',
   'http://127.0.0.1:5173',
 ]);
+const productionFrontendOrigins = new Set([
+  'https://stockpos-frontend-production.up.railway.app',
+]);
 const configuredFrontendOrigins = [process.env.FRONTEND_ORIGINS, process.env.FRONTEND_ORIGIN]
   .filter(Boolean)
   .flatMap((value) => String(value).split(','))
@@ -37,7 +40,11 @@ const configuredFrontendOrigins = [process.env.FRONTEND_ORIGINS, process.env.FRO
     }
   })
   .filter(Boolean);
-const allowedFrontendOrigins = new Set([...localFrontendOrigins, ...configuredFrontendOrigins]);
+const allowedFrontendOrigins = new Set([
+  ...localFrontendOrigins,
+  ...productionFrontendOrigins,
+  ...configuredFrontendOrigins,
+]);
 const isAllowedOrigin = (origin) => !origin || allowedFrontendOrigins.has(origin);
 const corsOrigin = (origin, callback) => callback(null, isAllowedOrigin(origin));
 
@@ -630,7 +637,7 @@ startServer();
 
 // 1. ตั้งค่า CORS สำหรับ HTTP & WebSockets
 if (!configuredFrontendOrigins.length) {
-  console.warn('FRONTEND_ORIGINS is not configured. Browser requests are limited to local development origins until it is set.');
+  console.warn('FRONTEND_ORIGINS is not configured. Only built-in local and production frontend origins are allowed; set it before adding another frontend domain.');
 }
 app.disable('x-powered-by');
 app.use(cors({

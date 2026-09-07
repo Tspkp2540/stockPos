@@ -162,7 +162,7 @@ Frontend จะแนบ `Idempotency-Key` ที่มีความยาว 
 
 ## API security
 
-กำหนด `FRONTEND_ORIGINS` เป็นโดเมน frontend ที่อนุญาต (หลายโดเมนคั่นด้วย comma) เพื่อจำกัดทั้ง REST API และ Socket.IO เช่น `https://stockpos.example.com,https://stockpos-staging.example.com` หากไม่มีค่านี้ browser จะเรียก API ได้เฉพาะ origin สำหรับพัฒนาในเครื่องเท่านั้น ส่วน health check หรือ API-to-API request ที่ไม่มี `Origin` ยังทำงานได้
+กำหนด `FRONTEND_ORIGINS` เป็นโดเมน frontend ที่อนุญาต (หลายโดเมนคั่นด้วย comma) เพื่อจำกัดทั้ง REST API และ Socket.IO เช่น `https://stockpos.example.com,https://stockpos-staging.example.com` ระบบมี production frontend ของ StockPOS และ origin สำหรับพัฒนาในเครื่องใน allowlist เริ่มต้น แต่ต้องกำหนดตัวแปรนี้ก่อนเพิ่มโดเมน frontend อื่น ส่วน health check หรือ API-to-API request ที่ไม่มี `Origin` ยังทำงานได้
 
 ระบบจำกัดจำนวนคำขอต่อ IP/ผู้ใช้ในหน่วยความจำ: ทุก `/api` สูงสุด 360 ครั้ง/นาที, login 12 ครั้ง/15 นาที, สมัครสมาชิก 5 ครั้ง/ชั่วโมง, public order lookup 30 ครั้ง/นาที และตรวจคูปอง/แต้ม 90 ครั้ง/นาทีต่อผู้ใช้ เมื่อเกินจะตอบ `429` พร้อม `Retry-After` และรหัส `RATE_LIMITED`
 
