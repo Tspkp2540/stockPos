@@ -8,6 +8,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - แยกสิทธิ์ `ADMIN`, `STAFF` และ `USER` ทุก API ตรวจสอบสิทธิ์ก่อนดำเนินการ
 - สร้างออเดอร์ ตัดวัตถุดิบตามสูตร BOM คำนวณต้นทุน, GP, รายรับสุทธิ และกำไร
 - จัดคิวออเดอร์รายวันแบบปลอดภัยจากเลขคิวซ้ำ
+- ป้องกันการสร้างออเดอร์ซ้ำเมื่อ client retry ด้วย `Idempotency-Key` ต่อผู้ใช้งาน: request เดิมจะคืนออเดอร์เดิมและไม่ตัดสต็อก ใช้คูปอง ชำระเงิน หรือคิดแต้มซ้ำ
 - อัปเดตสถานะออเดอร์แบบ `COOKING → READY → COMPLETED`, ยกเลิกออเดอร์ และคืนสต็อกเมื่อยกเลิก
 - บันทึกชื่อเล่น/เบอร์โทรของผู้ซื้อแบบไม่บังคับ เพื่อค้นหาออเดอร์ได้
 - หน้า public lookup ให้ลูกค้าหรือผู้ใช้ทั่วไปติดตามเฉพาะคิวออเดอร์ของวันปัจจุบัน หรือกรองด้วยเบอร์โทร
@@ -102,6 +103,7 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
    DATABASE_URL=postgres://username:password@hostname:5432/database_name
    AUTH_SECRET=replace_with_a_long_random_secret
    PORT=8080
+   FRONTEND_ORIGINS=https://your-frontend.example.com
    ```
 
 3. รันสำหรับพัฒนา
@@ -118,7 +120,7 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
 
 เมื่อ server เริ่มทำงาน จะสร้าง/เพิ่มโครงสร้างตารางที่จำเป็นแบบไม่ทำลายข้อมูล ได้แก่ `users`, `expenses`, `coupons`, `loyalty_accounts`, `loyalty_transactions` และคอลัมน์เพิ่มเติมของ `orders` โดยอัตโนมัติ
 
-สำหรับฐานข้อมูลที่ต้องจัดการ migration เอง ใช้ไฟล์ [database/20260901_add_order_discounts_and_coupons.sql](database/20260901_add_order_discounts_and_coupons.sql)
+สำหรับฐานข้อมูลที่ต้องจัดการ migration เอง ใช้ไฟล์ [database/20260901_add_order_discounts_and_coupons.sql](database/20260901_add_order_discounts_and_coupons.sql) และ [database/20260908_add_order_idempotency.sql](database/20260908_add_order_idempotency.sql)
 
 ## API หลัก
 
@@ -155,6 +157,14 @@ INSERT INTO coupons
 VALUES
   ('WELCOME10', 'PERCENT', 10, 100, 50, 100);
 ```
+
+Frontend จะแนบ `Idempotency-Key` ที่มีความยาว 8–120 ตัวอักษร (หรือ `client_request_id` ใน body) ทุกครั้งที่สร้างออเดอร์ และต้องใช้คีย์เดิมเมื่อ retry คำขอเดิม Backend ยังรองรับ client รุ่นเก่าที่ไม่ส่งคีย์ เพื่อให้การ deploy ไม่ทำให้หน้าร้านหยุดทำงาน แต่ client นั้นจะไม่ได้รับการป้องกันการส่งซ้ำ
+
+## API security
+
+กำหนด `FRONTEND_ORIGINS` เป็นโดเมน frontend ที่อนุญาต (หลายโดเมนคั่นด้วย comma) เพื่อจำกัดทั้ง REST API และ Socket.IO เช่น `https://stockpos.example.com,https://stockpos-staging.example.com` หากไม่มีค่านี้ browser จะเรียก API ได้เฉพาะ origin สำหรับพัฒนาในเครื่องเท่านั้น ส่วน health check หรือ API-to-API request ที่ไม่มี `Origin` ยังทำงานได้
+
+ระบบจำกัดจำนวนคำขอต่อ IP/ผู้ใช้ในหน่วยความจำ: ทุก `/api` สูงสุด 360 ครั้ง/นาที, login 12 ครั้ง/15 นาที, สมัครสมาชิก 5 ครั้ง/ชั่วโมง, public order lookup 30 ครั้ง/นาที และตรวจคูปอง/แต้ม 90 ครั้ง/นาทีต่อผู้ใช้ เมื่อเกินจะตอบ `429` พร้อม `Retry-After` และรหัส `RATE_LIMITED`
 
 ## Real-time events
 

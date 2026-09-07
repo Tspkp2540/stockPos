@@ -15,6 +15,81 @@ const productsRouter = require('../router/products');
 const purchaseOrdersRouter = require('../router/purchaseOrders');
 const { addInventoryLot, consumeLots, restoreOrderLots } = require('../utils/inventoryLots');
 
+const localFrontendOrigins = new Set([
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'http://127.0.0.1:5173',
+]);
+const configuredFrontendOrigins = [process.env.FRONTEND_ORIGINS, process.env.FRONTEND_ORIGIN]
+  .filter(Boolean)
+  .flatMap((value) => String(value).split(','))
+  .map((value) => value.trim())
+  .filter(Boolean)
+  .map((value) => {
+    try {
+      return new URL(value).origin;
+    } catch (error) {
+      console.warn(`Ignoring invalid FRONTEND_ORIGINS value: ${value}`);
+      return null;
+    }
+  })
+  .filter(Boolean);
+const allowedFrontendOrigins = new Set([...localFrontendOrigins, ...configuredFrontendOrigins]);
+const isAllowedOrigin = (origin) => !origin || allowedFrontendOrigins.has(origin);
+const corsOrigin = (origin, callback) => callback(null, isAllowedOrigin(origin));
+
+const clientAddress = (req) => {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.socket?.remoteAddress || req.ip || 'unknown';
+};
+const createRateLimiter = ({ name, windowMs, max, key = clientAddress }) => {
+  const buckets = new Map();
+  const maxTrackedKeys = 10000;
+  return (req, res, next) => {
+    const now = Date.now();
+    const bucketKey = `${name}:${key(req)}`;
+    let bucket = buckets.get(bucketKey);
+    if (!bucket || bucket.resetAt <= now) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      buckets.set(bucketKey, bucket);
+    }
+    bucket.count += 1;
+
+    if (buckets.size > maxTrackedKeys) {
+      for (const [storedKey, storedBucket] of buckets) {
+        if (storedBucket.resetAt <= now || buckets.size > maxTrackedKeys) buckets.delete(storedKey);
+      }
+    }
+
+    const remaining = Math.max(0, max - bucket.count);
+    res.set('RateLimit-Limit', String(max));
+    res.set('RateLimit-Remaining', String(remaining));
+    res.set('RateLimit-Reset', String(Math.ceil(bucket.resetAt / 1000)));
+    if (bucket.count <= max) return next();
+
+    const retryAfterSeconds = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+    res.set('Retry-After', String(retryAfterSeconds));
+    return res.status(429).json({
+      success: false,
+      error: `Too many ${name} requests. Please try again in ${retryAfterSeconds} seconds.`,
+      code: 'RATE_LIMITED',
+    });
+  };
+};
+const apiRateLimiter = createRateLimiter({ name: 'API', windowMs: 60 * 1000, max: 360 });
+const loginRateLimiter = createRateLimiter({ name: 'login', windowMs: 15 * 60 * 1000, max: 12 });
+const registrationRateLimiter = createRateLimiter({ name: 'registration', windowMs: 60 * 60 * 1000, max: 5 });
+const publicLookupRateLimiter = createRateLimiter({ name: 'public lookup', windowMs: 60 * 1000, max: 30 });
+const protectedLookupRateLimiter = createRateLimiter({
+  name: 'lookup',
+  windowMs: 60 * 1000,
+  max: 90,
+  key: (req) => req.user?.sub ? `user:${req.user.sub}` : clientAddress(req),
+});
+
 const isValidRecordDate = (value) => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const parsed = new Date(`${value}T00:00:00.000Z`);
@@ -211,6 +286,8 @@ const startServer = async () => {
       );
     }
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id)');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS client_request_id VARCHAR(120)');
+    await client.query('CREATE UNIQUE INDEX IF NOT EXISTS orders_user_client_request_unique_idx ON orders(user_id, client_request_id) WHERE client_request_id IS NOT NULL');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ');
     await client.query('ALTER TABLE IF EXISTS orders ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20)');
@@ -552,8 +629,24 @@ const startServer = async () => {
 startServer();
 
 // 1. ตั้งค่า CORS สำหรับ HTTP & WebSockets
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+if (!configuredFrontendOrigins.length) {
+  console.warn('FRONTEND_ORIGINS is not configured. Browser requests are limited to local development origins until it is set.');
+}
+app.disable('x-powered-by');
+app.use(cors({
+  origin: corsOrigin,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+  maxAge: 600,
+}));
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  next();
+});
+app.use(express.json({ limit: '1mb' }));
+app.use('/api', apiRateLimiter);
 
 // Disable caching for API responses to avoid 304 Not Modified in clients
 app.use('/api', (req, res, next) => {
@@ -599,7 +692,7 @@ const authConfigured = (res) => {
   return false;
 };
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', registrationRateLimiter, async (req, res) => {
   if (!authConfigured(res)) return;
   const username = String(req.body?.username || '').trim().toLowerCase();
   const fullName = String(req.body?.full_name || '').trim();
@@ -622,7 +715,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
   if (!authConfigured(res)) return;
   const username = String(req.body?.username || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
@@ -815,7 +908,7 @@ app.get('/api/loyalty/me', requireAuth, requireRoles('USER'), async (req, res) =
   }
 });
 
-app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), protectedLookupRateLimiter, async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (!isValidPhone(phone)) return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
   try {
@@ -839,7 +932,7 @@ app.get('/api/users/customers', requireAuth, requireRoles('ADMIN', 'STAFF'), asy
   }
 });
 
-app.post('/api/coupons/validate', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.post('/api/coupons/validate', requireAuth, requireRoles('ADMIN', 'STAFF'), protectedLookupRateLimiter, async (req, res) => {
   const code = normalizeCouponCode(req.body?.code);
   const amount = Math.max(0, Number(req.body?.amount) || 0);
   if (!code) return res.status(400).json({ success: false, error: 'Coupon code is required' });
@@ -966,9 +1059,11 @@ app.use('/api/products', requireAuth, requireRoles('ADMIN', 'STAFF'), productsRo
 
 const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE']
-  }
+    origin: corsOrigin,
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Authorization'],
+  },
+  allowRequest: (req, callback) => callback(null, isAllowedOrigin(req.headers.origin)),
 });
 app.set('socketio', io);
 
@@ -997,7 +1092,7 @@ io.on('connection', (socket) => {
 // ----------------------------------------------------
 
 // Dashboard สาธารณะ: แสดงเฉพาะคิวของวันนี้ หรือกรองด้วยเบอร์โทรได้
-app.post('/api/public/orders/lookup', async (req, res) => {
+app.post('/api/public/orders/lookup', publicLookupRateLimiter, async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (phone && !isValidPhone(phone)) {
     return res.status(400).json({ success: false, error: 'Please enter a valid phone number' });
@@ -1690,6 +1785,8 @@ app.delete('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, 
 // 📌 POST /api/orders - รับออเดอร์ใหม่ (ตัดสต็อคตามสูตร BOM, หัก GP และยิง Socket.io)
 app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   const { order_no, channel_id, items } = req.body;
+  const suppliedClientRequestId = String(req.get('Idempotency-Key') || req.body?.client_request_id || '').trim();
+  const clientRequestId = suppliedClientRequestId || null;
   const recordDate = selectedRecordDate(req.body?.record_date);
   const customerName = String(req.body?.customer_name || req.body?.customer_nickname || '').trim().slice(0, 120);
   const customerNickname = String(req.body?.customer_nickname || customerName).trim().slice(0, 80);
@@ -1711,6 +1808,9 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 
   if (!order_no || !channel_id || !items || !items.length) {
     return res.status(400).json({ success: false, error: 'Missing required order data' });
+  }
+  if (clientRequestId && !/^[A-Za-z0-9._:-]{8,120}$/.test(clientRequestId)) {
+    return res.status(400).json({ success: false, error: 'Idempotency-Key must contain 8-120 letters, numbers, dots, underscores, colons, or hyphens' });
   }
   if (customerPhone && !isValidPhone(customerPhone)) {
     return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
@@ -1735,6 +1835,25 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     const gpPercent = parseFloat(channelRes.rows[0].gp_percent);
     // Serialize queue allocation so that two orders created together cannot receive the same queue.
     await client.query('SELECT pg_advisory_xact_lock(910246)');
+    // A retry after a timeout reaches this point with the same key. Return the original
+    // order instead of applying stock, coupon, payment, and loyalty changes again.
+    if (clientRequestId) {
+      const existingRequest = await client.query(
+        `SELECT * FROM orders
+         WHERE user_id = $1 AND client_request_id = $2
+         LIMIT 1`,
+        [req.user.sub, clientRequestId]
+      );
+      if (existingRequest.rows.length) {
+        await client.query('COMMIT');
+        return res.json({
+          success: true,
+          message: 'Existing order returned for this request',
+          idempotent_replay: true,
+          data: existingRequest.rows[0]
+        });
+      }
+    }
     const queueResult = await client.query(
       `SELECT COALESCE(MAX(queue_no), 0) + 1 AS next_queue
        FROM orders
@@ -1749,10 +1868,10 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 
     // 2. สร้าง Order เริ่มต้น
     const orderRes = await client.query(
-      `INSERT INTO orders (order_no, channel_id, gross_amount, net_revenue, status, created_at, customer_name, customer_nickname, customer_phone, queue_no)
-       VALUES ($1, $2, 0, 0, 'COOKING', COALESCE($3::date::timestamp AT TIME ZONE 'Asia/Bangkok', CURRENT_TIMESTAMP), $4, $5, $6, $7)
+      `INSERT INTO orders (order_no, channel_id, gross_amount, net_revenue, status, created_at, customer_name, customer_nickname, customer_phone, queue_no, user_id, client_request_id)
+       VALUES ($1, $2, 0, 0, 'COOKING', COALESCE($3::date::timestamp AT TIME ZONE 'Asia/Bangkok', CURRENT_TIMESTAMP), $4, $5, $6, $7, $8, $9)
        RETURNING id`,
-      [order_no, channel_id, recordDate, customerName || null, customerNickname || null, customerPhone || null, queueNo]
+      [order_no, channel_id, recordDate, customerName || null, customerNickname || null, customerPhone || null, queueNo, req.user.sub, clientRequestId]
     );
     const orderId = orderRes.rows[0].id;
 
