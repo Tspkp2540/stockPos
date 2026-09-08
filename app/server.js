@@ -133,7 +133,7 @@ const publicUser = (user) => ({ id: Number(user.id), username: user.username, na
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const ROLE_PERMISSION_DEFAULTS = Object.freeze({
-  ADMIN: Object.fromEntries(['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'printing', 'finance', 'business-reports'].map((menu) => [menu, { view: true, create: true, update: true, delete: true }])),
+  ADMIN: Object.fromEntries(['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'role-permissions', 'printing', 'finance', 'business-reports'].map((menu) => [menu, { view: true, create: true, update: true, delete: true }])),
   STAFF: { pos: { view: true, create: true, update: true, delete: false }, orders: { view: true, create: false, update: true, delete: false }, kitchen: { view: true, create: false, update: true, delete: false }, 'cash-shifts': { view: true, create: true, update: true, delete: false }, menu: { view: true, create: false, update: false, delete: false }, 'sales-channels': { view: true, create: false, update: false, delete: false } },
   USER: { orders: { view: true, create: false, update: false, delete: false } },
 });
@@ -157,7 +157,7 @@ const requirePermission = (menu, action) => async (req, res, next) => {
   }
 };
 const permissionActions = ['view', 'create', 'update', 'delete'];
-const permissionMenus = ['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'printing', 'finance', 'business-reports'];
+const permissionMenus = ['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'role-permissions', 'printing', 'finance', 'business-reports'];
 const sanitizePermissions = (value) => Object.fromEntries(permissionMenus.map((menu) => [
   menu,
   Object.fromEntries(permissionActions.map((action) => [action, value?.[menu]?.[action] === true])),
@@ -1038,7 +1038,7 @@ app.put('/api/admin/go-live-checks/:key', requireAuth, requireRoles('ADMIN'), as
   }
 });
 
-app.get('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), requirePermission('role-permissions', 'view'), async (req, res) => {
   try {
     const result = await pool.query('SELECT role, base_role, display_name, permissions, updated_at FROM role_permissions ORDER BY role');
     const profiles = await Promise.all(result.rows.map(async (row) => ({
@@ -1051,7 +1051,7 @@ app.get('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), async
   }
 });
 
-app.post('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.post('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), requirePermission('role-permissions', 'create'), async (req, res) => {
   const role = String(req.body?.role || '').trim().toUpperCase();
   const displayName = String(req.body?.display_name || '').trim().slice(0, 80);
   const baseRole = String(req.body?.base_role || 'STAFF').trim().toUpperCase();
@@ -1073,7 +1073,7 @@ app.post('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), asyn
   }
 });
 
-app.put('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.put('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'), requirePermission('role-permissions', 'update'), async (req, res) => {
   const role = String(req.params.role || '').toUpperCase();
   if (role === 'ADMIN') return res.status(400).json({ success: false, error: 'Admin permissions cannot be changed' });
   try {
@@ -1090,7 +1090,7 @@ app.put('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'),
   }
 });
 
-app.delete('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.delete('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'), requirePermission('role-permissions', 'delete'), async (req, res) => {
   const role = String(req.params.role || '').toUpperCase();
   if (['ADMIN', 'STAFF', 'USER'].includes(role)) return res.status(400).json({ success: false, error: 'System roles cannot be deleted' });
   const client = await pool.connect();
@@ -1110,7 +1110,7 @@ app.delete('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN
   }
 });
 
-app.get('/api/admin/users', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/admin/users', requireAuth, requireRoles('ADMIN'), requirePermission('role-permissions', 'view'), async (req, res) => {
   try {
     const result = await pool.query('SELECT id, username, full_name, phone, role, role_key, created_at FROM users ORDER BY created_at DESC');
     res.json({ success: true, data: result.rows.map((user) => publicUser(user)) });
@@ -1119,7 +1119,7 @@ app.get('/api/admin/users', requireAuth, requireRoles('ADMIN'), async (req, res)
   }
 });
 
-app.put('/api/admin/users/:id/role', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.put('/api/admin/users/:id/role', requireAuth, requireRoles('ADMIN'), requirePermission('role-permissions', 'update'), async (req, res) => {
   const roleKey = String(req.body?.role_key || '').trim().toUpperCase();
   try {
     const roleResult = await pool.query('SELECT role, base_role FROM role_permissions WHERE role = $1', [roleKey]);
