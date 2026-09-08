@@ -132,6 +132,31 @@ const isValidPhone = (value) => /^\d{9,15}$/.test(value);
 const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase() });
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+const ROLE_PERMISSION_DEFAULTS = Object.freeze({
+  ADMIN: { operations: { view: true, create: true, update: true, delete: true }, pos: { view: true, create: true, update: true, delete: true }, orders: { view: true, create: true, update: true, delete: true } },
+  STAFF: { pos: { view: true, create: true, update: true, delete: false }, orders: { view: true, create: false, update: true, delete: false }, kitchen: { view: true, create: false, update: true, delete: false } },
+  USER: { orders: { view: true, create: false, update: false, delete: false } },
+});
+const rolePermissionsFor = async (role) => {
+  const result = await pool.query('SELECT permissions FROM role_permissions WHERE role = $1', [String(role || '').toUpperCase()]);
+  return result.rows[0]?.permissions || ROLE_PERMISSION_DEFAULTS[String(role || '').toUpperCase()] || {};
+};
+const requirePermission = (menu, action) => async (req, res, next) => {
+  if (req.user?.role === 'ADMIN') return next();
+  try {
+    const permissions = await rolePermissionsFor(req.user?.role);
+    if (permissions?.[menu]?.[action]) return next();
+    return res.status(403).json({ success: false, error: 'This role is not allowed to perform this action' });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+};
+const permissionActions = ['view', 'create', 'update', 'delete'];
+const permissionMenus = ['operations', 'pos', 'orders', 'kitchen'];
+const sanitizePermissions = (value) => Object.fromEntries(permissionMenus.map((menu) => [
+  menu,
+  Object.fromEntries(permissionActions.map((action) => [action, value?.[menu]?.[action] === true])),
+]));
 const DEFAULT_LOYALTY_RULES = Object.freeze({
   is_enabled: true,
   earn_mode: 'SPEND',
@@ -202,6 +227,8 @@ const loyaltyAccountPayload = (account) => account ? ({
   points_balance: Number(account.points_balance || 0),
   lifetime_points: Number(account.lifetime_points || 0),
   lifetime_spend: Number(account.lifetime_spend || 0),
+  order_count: Number(account.order_count || 0),
+  last_order_at: account.last_order_at || null,
   updated_at: account.updated_at,
 }) : null;
 const auditSensitiveFields = new Set(['password', 'password_hash', 'token', 'authorization', 'access_token', 'refresh_token']);
@@ -334,6 +361,22 @@ const startServer = async () => {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS role_permissions (
+        role VARCHAR(16) PRIMARY KEY CHECK (role IN ('ADMIN', 'STAFF', 'USER')),
+        permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    for (const [role, permissions] of Object.entries(ROLE_PERMISSION_DEFAULTS)) {
+      await client.query(
+        `INSERT INTO role_permissions (role, permissions)
+         VALUES ($1, $2::jsonb)
+         ON CONFLICT (role) DO NOTHING`,
+        [role, JSON.stringify(permissions)],
+      );
+    }
     await client.query('ALTER TABLE channels ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE');
     await client.query('ALTER TABLE channels ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP');
     await client.query('ALTER TABLE channels ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP');
@@ -816,7 +859,9 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, username, full_name, phone, role FROM users WHERE id = $1', [req.user.sub]);
     if (!result.rows.length) return res.status(401).json({ success: false, error: 'Session is no longer valid' });
-    res.json({ success: true, data: publicUser(result.rows[0]) });
+    const user = result.rows[0];
+    const permissions = await rolePermissionsFor(user.role);
+    res.json({ success: true, data: { ...publicUser(user), permissions } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -972,6 +1017,31 @@ app.put('/api/admin/go-live-checks/:key', requireAuth, requireRoles('ADMIN'), as
   }
 });
 
+app.get('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const result = await pool.query('SELECT role, permissions, updated_at FROM role_permissions ORDER BY role');
+    res.json({ success: true, data: result.rows.map((row) => ({ ...row, permissions: sanitizePermissions(row.permissions) })) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const role = String(req.params.role || '').toUpperCase();
+  if (!['STAFF', 'USER'].includes(role)) return res.status(400).json({ success: false, error: 'Only STAFF and USER permissions can be changed' });
+  try {
+    const permissions = sanitizePermissions(req.body?.permissions);
+    const result = await pool.query(
+      `UPDATE role_permissions SET permissions = $1::jsonb, updated_by = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE role = $3 RETURNING role, permissions, updated_at`,
+      [JSON.stringify(permissions), req.user.sub, role],
+    );
+    res.json({ success: true, data: { ...result.rows[0], permissions: sanitizePermissions(result.rows[0].permissions) } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   try {
     res.json({ success: true, data: await getLoyaltyRules() });
@@ -1033,6 +1103,114 @@ app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), pro
       [phone]
     );
     res.json({ success: true, data: { account: loyaltyAccountPayload(result.rows[0]), rules } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const search = String(req.query?.search || '').trim().slice(0, 120);
+  const limit = Math.min(200, Math.max(1, Number(req.query?.limit) || 100));
+  try {
+    const result = await pool.query(
+      `SELECT la.id, la.customer_phone, la.customer_name, la.points_balance, la.lifetime_points,
+              la.lifetime_spend, la.created_at, la.updated_at,
+              COUNT(DISTINCT o.id)::int AS order_count,
+              MAX(o.created_at) AS last_order_at
+       FROM loyalty_accounts la
+       LEFT JOIN orders o ON o.loyalty_account_id = la.id
+       WHERE ($1 = '' OR la.customer_phone ILIKE '%' || $1 || '%' OR la.customer_name ILIKE '%' || $1 || '%')
+       GROUP BY la.id
+       ORDER BY la.updated_at DESC, la.id DESC
+       LIMIT $2`,
+      [search, limit],
+    );
+    res.json({ success: true, data: result.rows.map(loyaltyAccountPayload) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const phone = normalizePhone(req.body?.customer_phone);
+  const name = String(req.body?.customer_name || '').trim().slice(0, 120);
+  const openingPoints = Number(req.body?.opening_points || 0);
+  if (!isValidPhone(phone)) return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
+  if (!Number.isInteger(openingPoints) || openingPoints < 0) return res.status(400).json({ success: false, error: 'Opening points must be a non-negative whole number' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const inserted = await client.query(
+      `INSERT INTO loyalty_accounts (customer_phone, customer_name, points_balance, lifetime_points)
+       VALUES ($1, $2, $3, $3)
+       RETURNING id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, created_at, updated_at`,
+      [phone, name, openingPoints],
+    );
+    const account = inserted.rows[0];
+    if (openingPoints) {
+      await client.query(
+        `INSERT INTO loyalty_transactions (loyalty_account_id, transaction_type, points_delta, amount, note)
+         VALUES ($1, 'EARN', $2, 0, 'Opening balance set by admin')`,
+        [account.id, openingPoints],
+      );
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, data: loyaltyAccountPayload(account) });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.code === '23505' ? 409 : 500).json({ success: false, error: error.code === '23505' ? 'A member already exists for this phone number' : error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const phone = normalizePhone(req.body?.customer_phone);
+  const name = String(req.body?.customer_name || '').trim().slice(0, 120);
+  const requestedPoints = Number(req.body?.points_balance);
+  if (!isValidPhone(phone)) return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
+  if (!Number.isInteger(requestedPoints) || requestedPoints < 0) return res.status(400).json({ success: false, error: 'Points balance must be a non-negative whole number' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const existing = await client.query(
+      `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend
+       FROM loyalty_accounts WHERE id = $1 FOR UPDATE`,
+      [req.params.id],
+    );
+    if (!existing.rows.length) throw requestError('Member not found', 404);
+    const account = existing.rows[0];
+    const pointDelta = requestedPoints - Number(account.points_balance || 0);
+    const updated = await client.query(
+      `UPDATE loyalty_accounts
+       SET customer_phone = $1, customer_name = $2, points_balance = $3,
+           lifetime_points = lifetime_points + $4, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $5
+       RETURNING id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, created_at, updated_at`,
+      [phone, name, requestedPoints, Math.max(0, pointDelta), account.id],
+    );
+    if (pointDelta) {
+      await client.query(
+        `INSERT INTO loyalty_transactions (loyalty_account_id, transaction_type, points_delta, amount, note)
+         VALUES ($1, $2, $3, 0, 'Balance adjusted by admin')`,
+        [account.id, pointDelta > 0 ? 'EARN' : 'REDEEM', pointDelta],
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, data: loyaltyAccountPayload(updated.rows[0]) });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || (error.code === '23505' ? 409 : 500)).json({ success: false, error: error.code === '23505' ? 'A member already exists for this phone number' : error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM loyalty_accounts WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Member not found' });
+    res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1422,7 +1600,7 @@ app.post('/api/shifts/:id/close', requireAuth, requireRoles('ADMIN', 'STAFF'), a
 });
 
 // 📌 GET /api/orders - ดึงรายการออเดอร์ล่าสุด
-app.get('/api/orders', requireAuth, async (req, res) => {
+app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (req, res) => {
   const isUser = req.user.role === 'USER';
   const userId = isUser ? req.user.sub : null;
   const limitClause = isUser ? '' : 'LIMIT 100';
@@ -1898,7 +2076,7 @@ app.delete('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, 
 });
 
 // 📌 POST /api/orders - รับออเดอร์ใหม่ (ตัดสต็อคตามสูตร BOM, หัก GP และยิง Socket.io)
-app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('pos', 'create'), async (req, res) => {
   const { order_no, channel_id, items } = req.body;
   const suppliedClientRequestId = String(req.get('Idempotency-Key') || req.body?.client_request_id || '').trim();
   const clientRequestId = suppliedClientRequestId || null;
@@ -2265,7 +2443,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 });
 
 // PUT /api/orders/:id - แก้ไข sales record พร้อมคำนวณยอดและสต็อกใหม่
-app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('orders', 'update'), async (req, res) => {
   const { id } = req.params;
   const { order_no, channel_id, items, status = 'COMPLETED' } = req.body || {};
   const recordDate = selectedRecordDate(req.body?.record_date);
@@ -2502,7 +2680,7 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
 });
 
 // 📌 PUT /api/orders/:id/status - อัปเดตสถานะออเดอร์ (COOKING -> READY -> COMPLETED)
-app.put('/api/orders/:id/status', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.put('/api/orders/:id/status', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('orders', 'update'), async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
   const allowedStatuses = new Set(['COOKING', 'READY', 'COMPLETED']);

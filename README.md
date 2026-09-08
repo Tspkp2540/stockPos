@@ -17,6 +17,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - ปิดยอดประจำวันแบบ audit snapshot: ต้องปิดกะเงินสดที่เปิดอยู่ก่อน จากนั้นระบบล็อกการเพิ่ม/แก้ไข/ลบออเดอร์และค่าใช้จ่ายของวันนั้น
 - ส่วนลดหน้าร้านและคูปอง โดยเก็บยอดก่อนลด ยอดลดแต่ละประเภท และยอดสุทธิในออเดอร์
 - ระบบสมาชิกผูกกับเบอร์โทร: Admin กำหนดการรับ/ใช้คะแนนและเพดานส่วนลดได้ พร้อมย้อนคะแนนอัตโนมัติเมื่อยกเลิกออเดอร์
+- Admin จัดการสมาชิกสะสมคะแนนได้ และกำหนดสิทธิ์ดู/สร้าง/แก้ไข/ลบของบทบาท Staff และ User สำหรับการขายและคำสั่งซื้อ
 - รับชำระด้วยเงินสด, QR, โอน, บัตร หรืออื่น ๆ พร้อมยอดรับและเงินทอน
 - เปิด/ปิดกะเงินสดแยกตามผู้ใช้งาน และคำนวณยอดคาดการณ์กับยอดต่างเมื่อปิดกะ
 - จัดการผู้ขายและใบรับวัตถุดิบเข้า รองรับหลายรายการต่อใบ ปรับต้นทุนเฉลี่ย และเก็บประวัติการเคลื่อนไหวสต็อก
@@ -120,7 +121,7 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
 
 เมื่อ server เริ่มทำงาน จะสร้าง/เพิ่มโครงสร้างตารางที่จำเป็นแบบไม่ทำลายข้อมูล ได้แก่ `users`, `expenses`, `coupons`, `loyalty_settings`, `loyalty_accounts`, `loyalty_transactions` และคอลัมน์เพิ่มเติมของ `orders` โดยอัตโนมัติ
 
-สำหรับฐานข้อมูลที่ต้องจัดการ migration เอง ใช้ไฟล์ [database/20260901_add_order_discounts_and_coupons.sql](database/20260901_add_order_discounts_and_coupons.sql), [database/20260908_add_order_idempotency.sql](database/20260908_add_order_idempotency.sql) และ [database/20260908_add_loyalty_settings.sql](database/20260908_add_loyalty_settings.sql)
+สำหรับฐานข้อมูลที่ต้องจัดการ migration เอง ใช้ไฟล์ [database/20260901_add_order_discounts_and_coupons.sql](database/20260901_add_order_discounts_and_coupons.sql), [database/20260908_add_order_idempotency.sql](database/20260908_add_order_idempotency.sql), [database/20260908_add_loyalty_settings.sql](database/20260908_add_loyalty_settings.sql) และ [database/20260908_add_role_permissions.sql](database/20260908_add_role_permissions.sql)
 
 ## API หลัก
 
@@ -143,7 +144,8 @@ Authorization: Bearer <token>
 | ช่องทางขาย | `GET/POST /api/channels`, `PUT /api/channels/:id` | Admin/Staff อ่าน, Admin จัดการ |
 | การเงิน | `GET /api/financial-summary`, `GET /api/sales-breakdown`, `GET /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD`, `GET/POST /api/daily-closings`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
 | คูปอง | `POST /api/coupons/validate`, `GET/POST/PUT /api/coupons` | Staff/Admin, Admin |
-| สมาชิก/คะแนนสะสม | `GET/PUT /api/loyalty/settings`, `POST /api/loyalty/lookup`, `GET /api/loyalty/me` | Admin ตั้งค่า, Staff/Admin ค้นหา, User ดูของตน |
+| สมาชิก/คะแนนสะสม | `GET/PUT /api/loyalty/settings`, `GET/POST/PUT/DELETE /api/admin/loyalty-members`, `POST /api/loyalty/lookup`, `GET /api/loyalty/me` | Admin จัดการ/ตั้งค่า, Staff/Admin ค้นหา, User ดูของตน |
+| สิทธิ์บทบาท | `GET/PUT /api/admin/role-permissions` | Admin |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
 | ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/lots`, `GET /api/inventory/movements` | Admin |
 | ใบสั่งซื้อ | `GET/POST /api/purchase-orders`, `PATCH /api/purchase-orders/:id/status`, `POST /api/purchase-orders/:id/receive` | Admin |
