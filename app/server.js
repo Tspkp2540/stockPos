@@ -129,7 +129,7 @@ const assertBusinessDateOpen = async (client, recordDate = null) => {
 };
 const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
 const isValidPhone = (value) => /^\d{9,15}$/.test(value);
-const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase() });
+const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase(), role_key: String(user.role_key || user.role).toLowerCase() });
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const ROLE_PERMISSION_DEFAULTS = Object.freeze({
@@ -144,7 +144,7 @@ const rolePermissionsFor = async (role) => {
 const requirePermission = (menu, action) => async (req, res, next) => {
   if (req.user?.role === 'ADMIN') return next();
   try {
-    const permissions = await rolePermissionsFor(req.user?.role);
+    const permissions = await rolePermissionsFor(req.user?.roleKey || req.user?.role);
     if (permissions?.[menu]?.[action]) return next();
     return res.status(403).json({ success: false, error: 'This role is not allowed to perform this action' });
   } catch (error) {
@@ -351,6 +351,10 @@ const startServer = async () => {
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS role_key VARCHAR(32)');
+    await client.query('UPDATE users SET role_key = role WHERE role_key IS NULL OR role_key = \'\'');
+    await client.query("ALTER TABLE users ALTER COLUMN role_key SET DEFAULT 'USER'");
+    await client.query('ALTER TABLE users ALTER COLUMN role_key SET NOT NULL');
     await client.query(`
       CREATE TABLE IF NOT EXISTS channels (
         id BIGSERIAL PRIMARY KEY,
@@ -363,16 +367,24 @@ const startServer = async () => {
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS role_permissions (
-        role VARCHAR(16) PRIMARY KEY CHECK (role IN ('ADMIN', 'STAFF', 'USER')),
+        role VARCHAR(32) PRIMARY KEY,
+        base_role VARCHAR(16) NOT NULL DEFAULT 'USER' CHECK (base_role IN ('ADMIN', 'STAFF', 'USER')),
+        display_name VARCHAR(80) NOT NULL DEFAULT '',
         permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
         updated_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query('ALTER TABLE role_permissions DROP CONSTRAINT IF EXISTS role_permissions_role_check');
+    await client.query('ALTER TABLE role_permissions ALTER COLUMN role TYPE VARCHAR(32)');
+    await client.query("ALTER TABLE role_permissions ADD COLUMN IF NOT EXISTS base_role VARCHAR(16) NOT NULL DEFAULT 'USER'");
+    await client.query("ALTER TABLE role_permissions ADD COLUMN IF NOT EXISTS display_name VARCHAR(80) NOT NULL DEFAULT ''");
+    await client.query('UPDATE role_permissions SET base_role = role WHERE role IN (\'ADMIN\', \'STAFF\', \'USER\') AND base_role = \'USER\'');
+    await client.query('UPDATE role_permissions SET display_name = role WHERE display_name = \'\'');
     for (const [role, permissions] of Object.entries(ROLE_PERMISSION_DEFAULTS)) {
       await client.query(
-        `INSERT INTO role_permissions (role, permissions)
-         VALUES ($1, $2::jsonb)
+        `INSERT INTO role_permissions (role, base_role, display_name, permissions)
+         VALUES ($1, $1, $1, $2::jsonb)
          ON CONFLICT (role) DO NOTHING`,
         [role, JSON.stringify(permissions)],
       );
@@ -827,7 +839,7 @@ app.post('/api/auth/register', registrationRateLimiter, async (req, res) => {
   try {
     const result = await pool.query(
       `INSERT INTO users (username, full_name, password_hash, role, phone)
-       VALUES ($1, $2, $3, 'USER', $4) RETURNING id, username, full_name, phone, role`,
+       VALUES ($1, $2, $3, 'USER', $4) RETURNING id, username, full_name, phone, role, role_key`,
       [username, fullName, hashPassword(password), phone]
     );
     const user = result.rows[0];
@@ -843,7 +855,7 @@ app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
   const username = String(req.body?.username || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
   try {
-    const result = await pool.query('SELECT id, username, full_name, phone, password_hash, role FROM users WHERE username = $1', [username]);
+    const result = await pool.query('SELECT id, username, full_name, phone, password_hash, role, role_key FROM users WHERE username = $1', [username]);
     const user = result.rows[0];
     if (!user || !verifyPassword(password, user.password_hash)) return res.status(401).json({ success: false, error: 'Invalid username or password' });
     if (needsPasswordUpgrade(user.password_hash)) {
@@ -857,10 +869,10 @@ app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
 
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, username, full_name, phone, role FROM users WHERE id = $1', [req.user.sub]);
+    const result = await pool.query('SELECT id, username, full_name, phone, role, role_key FROM users WHERE id = $1', [req.user.sub]);
     if (!result.rows.length) return res.status(401).json({ success: false, error: 'Session is no longer valid' });
     const user = result.rows[0];
-    const permissions = await rolePermissionsFor(user.role);
+    const permissions = await rolePermissionsFor(user.role_key || user.role);
     res.json({ success: true, data: { ...publicUser(user), permissions } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -1019,24 +1031,96 @@ app.put('/api/admin/go-live-checks/:key', requireAuth, requireRoles('ADMIN'), as
 
 app.get('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   try {
-    const result = await pool.query('SELECT role, permissions, updated_at FROM role_permissions ORDER BY role');
+    const result = await pool.query('SELECT role, base_role, display_name, permissions, updated_at FROM role_permissions ORDER BY role');
     res.json({ success: true, data: result.rows.map((row) => ({ ...row, permissions: sanitizePermissions(row.permissions) })) });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+app.post('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const role = String(req.body?.role || '').trim().toUpperCase();
+  const displayName = String(req.body?.display_name || '').trim().slice(0, 80);
+  const baseRole = String(req.body?.base_role || 'STAFF').trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9_]{2,31}$/.test(role) || ['ADMIN', 'STAFF', 'USER'].includes(role)) {
+    return res.status(400).json({ success: false, error: 'Role code must be 3-32 characters and cannot replace a system role' });
+  }
+  if (!['STAFF', 'USER'].includes(baseRole)) return res.status(400).json({ success: false, error: 'Custom roles must use STAFF or USER as a base role' });
+  try {
+    const permissions = sanitizePermissions(req.body?.permissions || ROLE_PERMISSION_DEFAULTS[baseRole]);
+    const result = await pool.query(
+      `INSERT INTO role_permissions (role, base_role, display_name, permissions, updated_by)
+       VALUES ($1, $2, $3, $4::jsonb, $5)
+       RETURNING role, base_role, display_name, permissions, updated_at`,
+      [role, baseRole, displayName || role, JSON.stringify(permissions), req.user.sub],
+    );
+    res.status(201).json({ success: true, data: { ...result.rows[0], permissions: sanitizePermissions(result.rows[0].permissions) } });
+  } catch (error) {
+    res.status(error.code === '23505' ? 409 : 500).json({ success: false, error: error.code === '23505' ? 'Role code already exists' : error.message });
+  }
+});
+
 app.put('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   const role = String(req.params.role || '').toUpperCase();
-  if (!['STAFF', 'USER'].includes(role)) return res.status(400).json({ success: false, error: 'Only STAFF and USER permissions can be changed' });
+  if (role === 'ADMIN') return res.status(400).json({ success: false, error: 'Admin permissions cannot be changed' });
   try {
     const permissions = sanitizePermissions(req.body?.permissions);
     const result = await pool.query(
-      `UPDATE role_permissions SET permissions = $1::jsonb, updated_by = $2, updated_at = CURRENT_TIMESTAMP
-       WHERE role = $3 RETURNING role, permissions, updated_at`,
-      [JSON.stringify(permissions), req.user.sub, role],
+      `UPDATE role_permissions SET display_name = COALESCE(NULLIF($1, ''), display_name), permissions = $2::jsonb, updated_by = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE role = $4 RETURNING role, base_role, display_name, permissions, updated_at`,
+      [String(req.body?.display_name || '').trim().slice(0, 80), JSON.stringify(permissions), req.user.sub, role],
     );
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'Role not found' });
     res.json({ success: true, data: { ...result.rows[0], permissions: sanitizePermissions(result.rows[0].permissions) } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const role = String(req.params.role || '').toUpperCase();
+  if (['ADMIN', 'STAFF', 'USER'].includes(role)) return res.status(400).json({ success: false, error: 'System roles cannot be deleted' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const assigned = await client.query('SELECT COUNT(*)::int AS total FROM users WHERE role_key = $1 FOR UPDATE', [role]);
+    if (Number(assigned.rows[0]?.total || 0)) throw requestError('Move users out of this role before deleting it', 409);
+    const deleted = await client.query('DELETE FROM role_permissions WHERE role = $1 RETURNING role', [role]);
+    if (!deleted.rows.length) throw requestError('Role not found', 404);
+    await client.query('COMMIT');
+    res.json({ success: true, data: deleted.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/admin/users', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, username, full_name, phone, role, role_key, created_at FROM users ORDER BY created_at DESC');
+    res.json({ success: true, data: result.rows.map((user) => publicUser(user)) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/admin/users/:id/role', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  const roleKey = String(req.body?.role_key || '').trim().toUpperCase();
+  try {
+    const roleResult = await pool.query('SELECT role, base_role FROM role_permissions WHERE role = $1', [roleKey]);
+    if (!roleResult.rows.length) return res.status(400).json({ success: false, error: 'Role not found' });
+    const targetId = Number(req.params.id);
+    if (!Number.isInteger(targetId) || targetId <= 0) return res.status(400).json({ success: false, error: 'User is invalid' });
+    if (targetId === Number(req.user.sub) && roleResult.rows[0].base_role !== 'ADMIN') return res.status(400).json({ success: false, error: 'You cannot remove your own admin access' });
+    const updated = await pool.query(
+      `UPDATE users SET role = $1, role_key = $2 WHERE id = $3
+       RETURNING id, username, full_name, phone, role, role_key`,
+      [roleResult.rows[0].base_role, roleResult.rows[0].role, targetId],
+    );
+    if (!updated.rows.length) return res.status(404).json({ success: false, error: 'User not found' });
+    res.json({ success: true, data: publicUser(updated.rows[0]) });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }

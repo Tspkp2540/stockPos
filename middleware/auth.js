@@ -38,6 +38,7 @@ const createToken = (user) => {
     sub: Number(user.id),
     username: user.username,
     role: user.role,
+    roleKey: user.role_key || user.role,
     exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS,
   };
   const body = encode(payload);
@@ -54,7 +55,7 @@ const verifyToken = (token) => {
   const expectedBuffer = Buffer.from(expected);
   if (actualBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(actualBuffer, expectedBuffer)) throw new Error('Invalid token');
   const payload = decode(body);
-  if (!Number.isInteger(payload.sub) || !roles.has(payload.role) || !payload.exp || payload.exp < Math.floor(Date.now() / 1000)) throw new Error('Expired token');
+  if (!Number.isInteger(payload.sub) || !roles.has(payload.role) || !/^[A-Z][A-Z0-9_]{0,31}$/.test(String(payload.roleKey || payload.role)) || !payload.exp || payload.exp < Math.floor(Date.now() / 1000)) throw new Error('Expired token');
   return payload;
 };
 
