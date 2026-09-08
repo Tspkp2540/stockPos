@@ -134,47 +134,63 @@ const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const DEFAULT_LOYALTY_RULES = Object.freeze({
   is_enabled: true,
+  earn_mode: 'SPEND',
   spend_per_point: 25,
+  cups_per_point: 1,
   baht_per_point: 0.1,
   max_redeem_percent: 50,
 });
 const loyaltyRules = (settings = DEFAULT_LOYALTY_RULES) => ({
   is_enabled: settings.is_enabled !== false,
+  earn_mode: String(settings.earn_mode || DEFAULT_LOYALTY_RULES.earn_mode).toUpperCase() === 'CUP' ? 'CUP' : 'SPEND',
   spend_per_point: Number(settings.spend_per_point || DEFAULT_LOYALTY_RULES.spend_per_point),
+  cups_per_point: Number(settings.cups_per_point || DEFAULT_LOYALTY_RULES.cups_per_point),
   baht_per_point: Number(settings.baht_per_point || DEFAULT_LOYALTY_RULES.baht_per_point),
   max_redeem_percent: Number(settings.max_redeem_percent ?? DEFAULT_LOYALTY_RULES.max_redeem_percent),
 });
-const loyaltyPointsForAmount = (amount, rules) => Math.floor(
-  Math.max(0, Number(amount) || 0) / loyaltyRules(rules).spend_per_point,
-);
+const loyaltyPointsForOrder = ({ amount, cups }, rules) => {
+  const activeRules = loyaltyRules(rules);
+  const basis = activeRules.earn_mode === 'CUP'
+    ? Math.max(0, Number(cups) || 0) / activeRules.cups_per_point
+    : Math.max(0, Number(amount) || 0) / activeRules.spend_per_point;
+  return Math.floor(basis);
+};
 const loyaltyDiscountForPoints = (points, rules) => Number((
   Math.max(0, Number(points) || 0) * loyaltyRules(rules).baht_per_point
 ).toFixed(2));
 const getLoyaltyRules = async (client = pool, { forUpdate = false } = {}) => {
   const result = await client.query(
-    `SELECT is_enabled, spend_per_point, baht_per_point, max_redeem_percent, updated_at
+    `SELECT is_enabled, earn_mode, spend_per_point, cups_per_point, baht_per_point, max_redeem_percent, updated_at
      FROM loyalty_settings WHERE id = 1${forUpdate ? ' FOR UPDATE' : ''}`,
   );
   return loyaltyRules(result.rows[0]);
 };
 const validateLoyaltySettings = (value = {}) => {
   const isEnabled = value.is_enabled;
+  const earnMode = String(value.earn_mode || 'SPEND').trim().toUpperCase();
   const spendPerPoint = Number(value.spend_per_point);
+  const cupsPerPoint = Number(value.cups_per_point);
   const bahtPerPoint = Number(value.baht_per_point);
   const maxRedeemPercent = Number(value.max_redeem_percent);
   if (typeof isEnabled !== 'boolean') throw requestError('Loyalty enabled setting must be true or false');
+  if (!['SPEND', 'CUP'].includes(earnMode)) throw requestError('Loyalty earn mode must be SPEND or CUP');
   if (!Number.isFinite(spendPerPoint) || spendPerPoint < 0.01 || spendPerPoint > 1000000) {
     throw requestError('Spend per point must be between 0.01 and 1,000,000');
   }
   if (!Number.isFinite(bahtPerPoint) || bahtPerPoint < 0.01 || bahtPerPoint > 100000) {
     throw requestError('Discount value per point must be between 0.01 and 100,000');
   }
+  if (!Number.isFinite(cupsPerPoint) || cupsPerPoint < 1 || cupsPerPoint > 100000) {
+    throw requestError('Cups per point must be between 1 and 100,000');
+  }
   if (!Number.isFinite(maxRedeemPercent) || maxRedeemPercent < 0 || maxRedeemPercent > 100) {
     throw requestError('Maximum redemption percentage must be between 0 and 100');
   }
   return {
     is_enabled: isEnabled,
+    earn_mode: earnMode,
     spend_per_point: Number(spendPerPoint.toFixed(2)),
+    cups_per_point: Number(cupsPerPoint.toFixed(2)),
     baht_per_point: Number(bahtPerPoint.toFixed(2)),
     max_redeem_percent: Number(maxRedeemPercent.toFixed(2)),
   };
@@ -344,13 +360,17 @@ const startServer = async () => {
       CREATE TABLE IF NOT EXISTS loyalty_settings (
         id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
         is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        earn_mode VARCHAR(12) NOT NULL DEFAULT 'SPEND' CHECK (earn_mode IN ('SPEND', 'CUP')),
         spend_per_point NUMERIC(12, 2) NOT NULL DEFAULT 25 CHECK (spend_per_point > 0),
+        cups_per_point NUMERIC(12, 2) NOT NULL DEFAULT 1 CHECK (cups_per_point > 0),
         baht_per_point NUMERIC(12, 2) NOT NULL DEFAULT 0.10 CHECK (baht_per_point > 0),
         max_redeem_percent NUMERIC(5, 2) NOT NULL DEFAULT 50 CHECK (max_redeem_percent >= 0 AND max_redeem_percent <= 100),
         updated_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query("ALTER TABLE loyalty_settings ADD COLUMN IF NOT EXISTS earn_mode VARCHAR(12) NOT NULL DEFAULT 'SPEND'");
+    await client.query('ALTER TABLE loyalty_settings ADD COLUMN IF NOT EXISTS cups_per_point NUMERIC(12, 2) NOT NULL DEFAULT 1');
     await client.query(`
       INSERT INTO loyalty_settings (id)
       VALUES (1)
@@ -965,13 +985,15 @@ app.put('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), async (req,
     const settings = validateLoyaltySettings(req.body);
     const result = await pool.query(
       `UPDATE loyalty_settings
-       SET is_enabled = $1, spend_per_point = $2, baht_per_point = $3,
-           max_redeem_percent = $4, updated_by = $5, updated_at = CURRENT_TIMESTAMP
+       SET is_enabled = $1, earn_mode = $2, spend_per_point = $3, cups_per_point = $4,
+           baht_per_point = $5, max_redeem_percent = $6, updated_by = $7, updated_at = CURRENT_TIMESTAMP
        WHERE id = 1
-       RETURNING is_enabled, spend_per_point, baht_per_point, max_redeem_percent, updated_at`,
+       RETURNING is_enabled, earn_mode, spend_per_point, cups_per_point, baht_per_point, max_redeem_percent, updated_at`,
       [
         settings.is_enabled,
+        settings.earn_mode,
         settings.spend_per_point,
+        settings.cups_per_point,
         settings.baht_per_point,
         settings.max_redeem_percent,
         req.user.sub,
@@ -1958,6 +1980,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 
     let subtotalAmount = 0;
     let totalCogs = 0;
+    let totalCups = 0;
 
     // 2. สร้าง Order เริ่มต้น
     const orderRes = await client.query(
@@ -1975,6 +1998,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
       if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
         throw requestError('Order item quantity and price are invalid');
       }
+      totalCups += quantity;
       const productResult = await client.query(
         `SELECT p.id, p.name, p.is_sold_out, p.price_retail,
                 pcs.is_active AS channel_is_active, pcs.price_retail AS channel_price_retail
@@ -2113,7 +2137,9 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 
     const discountAmount = manualDiscountAmount + couponDiscountAmount + loyaltyDiscountAmount;
     const grossAmount = Math.max(0, subtotalAmount - discountAmount);
-    const loyaltyPointsEarned = loyaltyAccount ? loyaltyPointsForAmount(grossAmount, currentLoyaltyRules) : 0;
+    const loyaltyPointsEarned = loyaltyAccount
+      ? loyaltyPointsForOrder({ amount: grossAmount, cups: totalCups }, currentLoyaltyRules)
+      : 0;
 
     const paidAmount = grossAmount;
     let amountReceived = paidAmount;
