@@ -133,16 +133,21 @@ const publicUser = (user) => ({ id: Number(user.id), username: user.username, na
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const ROLE_PERMISSION_DEFAULTS = Object.freeze({
-  ADMIN: { operations: { view: true, create: true, update: true, delete: true }, pos: { view: true, create: true, update: true, delete: true }, orders: { view: true, create: true, update: true, delete: true } },
-  STAFF: { pos: { view: true, create: true, update: true, delete: false }, orders: { view: true, create: false, update: true, delete: false }, kitchen: { view: true, create: false, update: true, delete: false } },
+  ADMIN: Object.fromEntries(['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'printing', 'finance', 'business-reports'].map((menu) => [menu, { view: true, create: true, update: true, delete: true }])),
+  STAFF: { pos: { view: true, create: true, update: true, delete: false }, orders: { view: true, create: false, update: true, delete: false }, kitchen: { view: true, create: false, update: true, delete: false }, 'cash-shifts': { view: true, create: true, update: true, delete: false }, menu: { view: true, create: false, update: false, delete: false }, 'sales-channels': { view: true, create: false, update: false, delete: false } },
   USER: { orders: { view: true, create: false, update: false, delete: false } },
 });
 const rolePermissionsFor = async (role) => {
   const result = await pool.query('SELECT permissions FROM role_permissions WHERE role = $1', [String(role || '').toUpperCase()]);
-  return result.rows[0]?.permissions || ROLE_PERMISSION_DEFAULTS[String(role || '').toUpperCase()] || {};
+  const defaults = ROLE_PERMISSION_DEFAULTS[String(role || '').toUpperCase()] || {};
+  const stored = result.rows[0]?.permissions || {};
+  return Object.fromEntries(permissionMenus.map((menu) => [menu, Object.fromEntries(permissionActions.map((action) => [
+    action,
+    typeof stored?.[menu]?.[action] === 'boolean' ? stored[menu][action] : defaults?.[menu]?.[action] === true,
+  ]))]));
 };
 const requirePermission = (menu, action) => async (req, res, next) => {
-  if (req.user?.role === 'ADMIN') return next();
+  if (req.user?.roleKey === 'ADMIN' || (!req.user?.roleKey && req.user?.role === 'ADMIN')) return next();
   try {
     const permissions = await rolePermissionsFor(req.user?.roleKey || req.user?.role);
     if (permissions?.[menu]?.[action]) return next();
@@ -152,11 +157,15 @@ const requirePermission = (menu, action) => async (req, res, next) => {
   }
 };
 const permissionActions = ['view', 'create', 'update', 'delete'];
-const permissionMenus = ['operations', 'pos', 'orders', 'kitchen'];
+const permissionMenus = ['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'printing', 'finance', 'business-reports'];
 const sanitizePermissions = (value) => Object.fromEntries(permissionMenus.map((menu) => [
   menu,
   Object.fromEntries(permissionActions.map((action) => [action, value?.[menu]?.[action] === true])),
 ]));
+const requireResourcePermission = (resource) => (req, res, next) => {
+  const action = req.method === 'GET' ? 'view' : req.method === 'POST' ? 'create' : req.method === 'DELETE' ? 'delete' : 'update';
+  return requirePermission(resource, action)(req, res, next);
+};
 const DEFAULT_LOYALTY_RULES = Object.freeze({
   is_enabled: true,
   earn_mode: 'SPEND',
@@ -1032,7 +1041,11 @@ app.put('/api/admin/go-live-checks/:key', requireAuth, requireRoles('ADMIN'), as
 app.get('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   try {
     const result = await pool.query('SELECT role, base_role, display_name, permissions, updated_at FROM role_permissions ORDER BY role');
-    res.json({ success: true, data: result.rows.map((row) => ({ ...row, permissions: sanitizePermissions(row.permissions) })) });
+    const profiles = await Promise.all(result.rows.map(async (row) => ({
+      ...row,
+      permissions: await rolePermissionsFor(row.role),
+    })));
+    res.json({ success: true, data: profiles });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1045,7 +1058,7 @@ app.post('/api/admin/role-permissions', requireAuth, requireRoles('ADMIN'), asyn
   if (!/^[A-Z][A-Z0-9_]{2,31}$/.test(role) || ['ADMIN', 'STAFF', 'USER'].includes(role)) {
     return res.status(400).json({ success: false, error: 'Role code must be 3-32 characters and cannot replace a system role' });
   }
-  if (!['STAFF', 'USER'].includes(baseRole)) return res.status(400).json({ success: false, error: 'Custom roles must use STAFF or USER as a base role' });
+  if (!['ADMIN', 'STAFF', 'USER'].includes(baseRole)) return res.status(400).json({ success: false, error: 'Base role is invalid' });
   try {
     const permissions = sanitizePermissions(req.body?.permissions || ROLE_PERMISSION_DEFAULTS[baseRole]);
     const result = await pool.query(
@@ -1126,7 +1139,7 @@ app.put('/api/admin/users/:id/role', requireAuth, requireRoles('ADMIN'), async (
   }
 });
 
-app.get('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), requirePermission('loyalty-settings', 'view'), async (req, res) => {
   try {
     res.json({ success: true, data: await getLoyaltyRules() });
   } catch (error) {
@@ -1134,7 +1147,7 @@ app.get('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), async (req,
   }
 });
 
-app.put('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.put('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), requirePermission('loyalty-settings', 'update'), async (req, res) => {
   try {
     const settings = validateLoyaltySettings(req.body);
     const result = await pool.query(
@@ -1176,7 +1189,7 @@ app.get('/api/loyalty/me', requireAuth, requireRoles('USER'), async (req, res) =
   }
 });
 
-app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), protectedLookupRateLimiter, async (req, res) => {
+app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('pos', 'view'), protectedLookupRateLimiter, async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (!isValidPhone(phone)) return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
   try {
@@ -1192,7 +1205,7 @@ app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), pro
   }
 });
 
-app.get('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), requirePermission('loyalty-members', 'view'), async (req, res) => {
   const search = String(req.query?.search || '').trim().slice(0, 120);
   const limit = Math.min(200, Math.max(1, Number(req.query?.limit) || 100));
   try {
@@ -1215,7 +1228,7 @@ app.get('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), async 
   }
 });
 
-app.post('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.post('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), requirePermission('loyalty-members', 'create'), async (req, res) => {
   const phone = normalizePhone(req.body?.customer_phone);
   const name = String(req.body?.customer_name || '').trim().slice(0, 120);
   const openingPoints = Number(req.body?.opening_points || 0);
@@ -1248,7 +1261,7 @@ app.post('/api/admin/loyalty-members', requireAuth, requireRoles('ADMIN'), async
   }
 });
 
-app.put('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.put('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), requirePermission('loyalty-members', 'update'), async (req, res) => {
   const phone = normalizePhone(req.body?.customer_phone);
   const name = String(req.body?.customer_name || '').trim().slice(0, 120);
   const requestedPoints = Number(req.body?.points_balance);
@@ -1290,7 +1303,7 @@ app.put('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), as
   }
 });
 
-app.delete('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.delete('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), requirePermission('loyalty-members', 'delete'), async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM loyalty_accounts WHERE id = $1 RETURNING id', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ success: false, error: 'Member not found' });
@@ -1309,7 +1322,7 @@ app.get('/api/users/customers', requireAuth, requireRoles('ADMIN', 'STAFF'), asy
   }
 });
 
-app.post('/api/coupons/validate', requireAuth, requireRoles('ADMIN', 'STAFF'), protectedLookupRateLimiter, async (req, res) => {
+app.post('/api/coupons/validate', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('pos', 'view'), protectedLookupRateLimiter, async (req, res) => {
   const code = normalizeCouponCode(req.body?.code);
   const amount = Math.max(0, Number(req.body?.amount) || 0);
   if (!code) return res.status(400).json({ success: false, error: 'Coupon code is required' });
@@ -1339,7 +1352,7 @@ app.post('/api/coupons/validate', requireAuth, requireRoles('ADMIN', 'STAFF'), p
   }
 });
 
-app.get('/api/coupons', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/coupons', requireAuth, requireRoles('ADMIN'), requirePermission('coupons', 'view'), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, code, discount_type, discount_value, min_order_amount, max_discount_amount,
@@ -1352,7 +1365,7 @@ app.get('/api/coupons', requireAuth, requireRoles('ADMIN'), async (req, res) => 
   }
 });
 
-app.post('/api/coupons', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.post('/api/coupons', requireAuth, requireRoles('ADMIN'), requirePermission('coupons', 'create'), async (req, res) => {
   const code = normalizeCouponCode(req.body?.code);
   const discountType = String(req.body?.discount_type || '').toUpperCase();
   const discountValue = Number(req.body?.discount_value);
@@ -1387,7 +1400,7 @@ app.post('/api/coupons', requireAuth, requireRoles('ADMIN'), async (req, res) =>
   }
 });
 
-app.put('/api/coupons/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.put('/api/coupons/:id', requireAuth, requireRoles('ADMIN'), requirePermission('coupons', 'update'), async (req, res) => {
   const couponId = Number(req.params.id);
   const code = normalizeCouponCode(req.body?.code);
   const discountType = String(req.body?.discount_type || '').toUpperCase();
@@ -1429,10 +1442,10 @@ app.put('/api/coupons/:id', requireAuth, requireRoles('ADMIN'), async (req, res)
 });
 
 // Register routers after middleware
-app.use('/api/inventory', requireAuth, requireRoles('ADMIN'), inventoryRouter);
-app.use('/api/purchase-orders', requireAuth, requireRoles('ADMIN'), purchaseOrdersRouter);
+app.use('/api/inventory', requireAuth, requireRoles('ADMIN'), requireResourcePermission('inventory'), inventoryRouter);
+app.use('/api/purchase-orders', requireAuth, requireRoles('ADMIN'), requireResourcePermission('procurement'), purchaseOrdersRouter);
 app.use('/api/orders', requireAuth, ordersRouter);
-app.use('/api/products', requireAuth, requireRoles('ADMIN', 'STAFF'), productsRouter);
+app.use('/api/products', requireAuth, requireRoles('ADMIN', 'STAFF'), requireResourcePermission('menu'), productsRouter);
 
 const io = new Server(server, {
   cors: {
@@ -1516,7 +1529,7 @@ app.get('/health', (req, res) => {
 });
 
 // 📌 GET /api/channels - ดึงรายชื่อช่องทางขาย
-app.get('/api/channels', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.get('/api/channels', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('sales-channels', 'view'), async (req, res) => {
   try {
     const result = await pool.query(
       req.user.role === 'ADMIN'
@@ -1540,7 +1553,7 @@ const normalizeChannelPayload = (body = {}) => {
   return { name, gpPercent, isActive };
 };
 
-app.post('/api/channels', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.post('/api/channels', requireAuth, requireRoles('ADMIN'), requirePermission('sales-channels', 'create'), async (req, res) => {
   try {
     const { name, gpPercent, isActive } = normalizeChannelPayload(req.body);
     const result = await pool.query(
@@ -1555,7 +1568,7 @@ app.post('/api/channels', requireAuth, requireRoles('ADMIN'), async (req, res) =
   }
 });
 
-app.put('/api/channels/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.put('/api/channels/:id', requireAuth, requireRoles('ADMIN'), requirePermission('sales-channels', 'update'), async (req, res) => {
   try {
     const { name, gpPercent, isActive } = normalizeChannelPayload(req.body);
     const result = await pool.query(
@@ -1581,7 +1594,7 @@ const shiftWithCashSales = `
   LEFT JOIN order_payments op ON op.cash_shift_id = cs.id
 `;
 
-app.get('/api/shifts/current', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.get('/api/shifts/current', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('cash-shifts', 'view'), async (req, res) => {
   try {
     const result = await pool.query(
       `${shiftWithCashSales}
@@ -1597,7 +1610,7 @@ app.get('/api/shifts/current', requireAuth, requireRoles('ADMIN', 'STAFF'), asyn
   }
 });
 
-app.get('/api/shifts', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/shifts', requireAuth, requireRoles('ADMIN'), requirePermission('cash-shifts', 'view'), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT cs.*, opened_user.full_name AS opened_by_name,
@@ -1619,7 +1632,7 @@ app.get('/api/shifts', requireAuth, requireRoles('ADMIN'), async (req, res) => {
   }
 });
 
-app.post('/api/shifts/open', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.post('/api/shifts/open', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('cash-shifts', 'create'), async (req, res) => {
   const openingCash = Number(req.body?.opening_cash || 0);
   const openingNote = String(req.body?.opening_note || '').trim().slice(0, 500);
   if (!Number.isFinite(openingCash) || openingCash < 0) {
@@ -1638,7 +1651,7 @@ app.post('/api/shifts/open', requireAuth, requireRoles('ADMIN', 'STAFF'), async 
   }
 });
 
-app.post('/api/shifts/:id/close', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+app.post('/api/shifts/:id/close', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('cash-shifts', 'update'), async (req, res) => {
   const closingCash = Number(req.body?.closing_cash);
   const closingNote = String(req.body?.closing_note || '').trim().slice(0, 500);
   if (!Number.isFinite(closingCash) || closingCash < 0) {
@@ -1763,7 +1776,7 @@ app.get('/api/inventory', requireAuth, requireRoles('ADMIN'), async (req, res) =
 });
 
 // 📌 GET /api/financial-summary?date=YYYY-MM-DD - ดึงยอดสรุปตามวันที่ที่เลือก
-app.get('/api/financial-summary', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/financial-summary', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'view'), async (req, res) => {
   const recordDate = selectedRecordDate(req.query?.date);
   try {
     const query = `
@@ -1788,7 +1801,7 @@ app.get('/api/financial-summary', requireAuth, requireRoles('ADMIN'), async (req
 });
 
 // 📊 GET /api/sales-breakdown?date=YYYY-MM-DD - สรุปยอดตามช่องทางและวิธีชำระเงิน
-app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'view'), async (req, res) => {
   const recordDate = selectedRecordDate(req.query?.date);
   const dateFilter = "DATE(o.created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)";
   try {
@@ -1831,7 +1844,7 @@ app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), async (req, 
 });
 
 // 📈 GET /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD - รายงานยอดขายเพื่อบริหารร้าน
-app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), requirePermission('business-reports', 'view'), async (req, res) => {
   const from = selectedRecordDate(req.query?.from);
   const to = selectedRecordDate(req.query?.to);
   if (!from || !to || from > to) {
@@ -1985,7 +1998,7 @@ app.get('/api/reports/summary', requireAuth, requireRoles('ADMIN'), async (req, 
 });
 
 // 📒 GET /api/daily-closings?date=YYYY-MM-DD - สถานะปิดยอดของวันนั้น
-app.get('/api/daily-closings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/daily-closings', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'view'), async (req, res) => {
   const businessDate = selectedRecordDate(req.query?.date);
   if (!businessDate) return res.status(400).json({ success: false, error: 'Please provide a valid business date' });
   try {
@@ -2003,7 +2016,7 @@ app.get('/api/daily-closings', requireAuth, requireRoles('ADMIN'), async (req, r
 });
 
 // 📒 POST /api/daily-closings - ปิดยอดและเก็บ snapshot รายวัน
-app.post('/api/daily-closings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.post('/api/daily-closings', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'update'), async (req, res) => {
   const businessDate = selectedRecordDate(req.body?.business_date);
   const note = String(req.body?.note || '').trim().slice(0, 1000);
   if (!businessDate || businessDate > bangkokToday()) {
@@ -2075,7 +2088,7 @@ app.post('/api/daily-closings', requireAuth, requireRoles('ADMIN'), async (req, 
 });
 
 // POST /api/expenses - บันทึกค่าใช้จ่ายประจำวัน
-app.post('/api/expenses', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.post('/api/expenses', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'create'), async (req, res) => {
   const amount = Number(req.body?.amount);
   const category = String(req.body?.category || 'OPERATING_EXPENSE').trim();
   const description = String(req.body?.description || '').trim();
@@ -2100,7 +2113,7 @@ app.post('/api/expenses', requireAuth, requireRoles('ADMIN'), async (req, res) =
 });
 
 // GET /api/expenses - รายการค่าใช้จ่ายทั้งหมด
-app.get('/api/expenses', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/expenses', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'view'), async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM expenses ORDER BY created_at DESC');
     res.json({ success: true, data: result.rows });
@@ -2110,7 +2123,7 @@ app.get('/api/expenses', requireAuth, requireRoles('ADMIN'), async (req, res) =>
 });
 
 // PUT /api/expenses/:id - แก้ไขรายการค่าใช้จ่าย
-app.put('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.put('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'update'), async (req, res) => {
   const amount = Number(req.body?.amount);
   const category = String(req.body?.category || '').trim();
   const description = String(req.body?.description || '').trim();
@@ -2143,7 +2156,7 @@ app.put('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, res
 });
 
 // DELETE /api/expenses/:id - ลบรายการค่าใช้จ่าย
-app.delete('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.delete('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), requirePermission('finance', 'delete'), async (req, res) => {
   try {
     const existing = await pool.query(
       `SELECT DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date
