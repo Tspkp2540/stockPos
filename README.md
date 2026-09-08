@@ -16,7 +16,7 @@ Backend สำหรับระบบจัดการร้าน StockPOS �
 - บันทึก/แก้ไข/ลบค่าใช้จ่าย สรุปการเงินตามวันที่ รายงานยอดขายแยกตามช่องทาง/วิธีชำระเงิน และรายงานเชิงธุรกิจตามช่วงเวลา: ยอดรายเมนู, ช่องทาง, ชั่วโมงขายดี, ส่วนลด, GP, ต้นทุน และกำไร
 - ปิดยอดประจำวันแบบ audit snapshot: ต้องปิดกะเงินสดที่เปิดอยู่ก่อน จากนั้นระบบล็อกการเพิ่ม/แก้ไข/ลบออเดอร์และค่าใช้จ่ายของวันนั้น
 - ส่วนลดหน้าร้านและคูปอง โดยเก็บยอดก่อนลด ยอดลดแต่ละประเภท และยอดสุทธิในออเดอร์
-- ระบบสมาชิกผูกกับเบอร์โทร: ทุก 25 บาทรับ 1 แต้ม, ใช้ 10 แต้มลดได้ 1 บาท และย้อนแต้มอัตโนมัติเมื่อยกเลิกออเดอร์
+- ระบบสมาชิกผูกกับเบอร์โทร: Admin กำหนดการรับ/ใช้คะแนนและเพดานส่วนลดได้ พร้อมย้อนคะแนนอัตโนมัติเมื่อยกเลิกออเดอร์
 - รับชำระด้วยเงินสด, QR, โอน, บัตร หรืออื่น ๆ พร้อมยอดรับและเงินทอน
 - เปิด/ปิดกะเงินสดแยกตามผู้ใช้งาน และคำนวณยอดคาดการณ์กับยอดต่างเมื่อปิดกะ
 - จัดการผู้ขายและใบรับวัตถุดิบเข้า รองรับหลายรายการต่อใบ ปรับต้นทุนเฉลี่ย และเก็บประวัติการเคลื่อนไหวสต็อก
@@ -59,9 +59,9 @@ Admin ใช้หน้า **พร้อมเปิดใช้จริง**
 
 ## สมาชิกและแต้มสะสม
 
-เมื่อลูกค้าระบุเบอร์โทรครั้งแรก ระบบจะสร้างบัญชีใน `loyalty_accounts` ให้อัตโนมัติ โดยคิด 1 แต้มต่อทุก 25 บาทของยอดชำระหลังหักส่วนลดทั้งหมด ลูกค้าใช้ 10 แต้มลดได้ 1 บาท และใช้ได้ไม่เกิน 50% ของยอดหลังหักส่วนลดหน้าร้าน/คูปอง เพื่อให้ยังมีมูลค่าการขายคงเหลือ
+Admin ตั้งกติกาผ่านหน้า **ตั้งค่าคะแนนสะสม** ได้ ได้แก่ การเปิด/ปิดระบบ, ยอดซื้อที่ได้รับ 1 คะแนน, มูลค่าส่วนลดต่อ 1 คะแนน และสัดส่วนส่วนลดสูงสุดที่ใช้คะแนนได้ต่อคำสั่งซื้อ ค่าเริ่มต้นคือทุก 25 บาทได้รับ 1 คะแนน, 10 คะแนนลดได้ 1 บาท และลดได้ไม่เกิน 50% ของยอดหลังหักส่วนลดหน้าร้าน/คูปอง
 
-พนักงานค้นหาแต้มจากเบอร์โทรก่อนยืนยันออเดอร์ได้ หน้า User แสดงแต้มคงเหลือและแต้มที่ได้รับหรือใช้ในประวัติออเดอร์ ระบบบันทึกทุกความเคลื่อนไหวไว้ใน `loyalty_transactions`; หากยกเลิกออเดอร์ ระบบคืนแต้มที่ใช้และย้อนแต้มที่เคยได้รับใน transaction เดียวกับการคืนสต็อก
+Backend อ่านกติกาปัจจุบันใน transaction เดียวกับการสร้างออเดอร์ จึงไม่รับค่าอัตราคะแนนจากหน้าเว็บ พนักงานค้นหาคะแนนจากเบอร์โทรก่อนยืนยันออเดอร์ได้ หน้า User แสดงคะแนนคงเหลือและประวัติการรับ/ใช้คะแนน ระบบบันทึกทุกความเคลื่อนไหวไว้ใน `loyalty_transactions`; หากยกเลิกออเดอร์ ระบบคืนคะแนนที่ใช้และย้อนคะแนนที่เคยได้รับใน transaction เดียวกับการคืนสต็อก
 
 ## ตัวเลือกเมนู (Modifier)
 
@@ -118,9 +118,9 @@ Admin กำหนดกลุ่มตัวเลือกแยกตาม�
    npm start
    ```
 
-เมื่อ server เริ่มทำงาน จะสร้าง/เพิ่มโครงสร้างตารางที่จำเป็นแบบไม่ทำลายข้อมูล ได้แก่ `users`, `expenses`, `coupons`, `loyalty_accounts`, `loyalty_transactions` และคอลัมน์เพิ่มเติมของ `orders` โดยอัตโนมัติ
+เมื่อ server เริ่มทำงาน จะสร้าง/เพิ่มโครงสร้างตารางที่จำเป็นแบบไม่ทำลายข้อมูล ได้แก่ `users`, `expenses`, `coupons`, `loyalty_settings`, `loyalty_accounts`, `loyalty_transactions` และคอลัมน์เพิ่มเติมของ `orders` โดยอัตโนมัติ
 
-สำหรับฐานข้อมูลที่ต้องจัดการ migration เอง ใช้ไฟล์ [database/20260901_add_order_discounts_and_coupons.sql](database/20260901_add_order_discounts_and_coupons.sql) และ [database/20260908_add_order_idempotency.sql](database/20260908_add_order_idempotency.sql)
+สำหรับฐานข้อมูลที่ต้องจัดการ migration เอง ใช้ไฟล์ [database/20260901_add_order_discounts_and_coupons.sql](database/20260901_add_order_discounts_and_coupons.sql), [database/20260908_add_order_idempotency.sql](database/20260908_add_order_idempotency.sql) และ [database/20260908_add_loyalty_settings.sql](database/20260908_add_loyalty_settings.sql)
 
 ## API หลัก
 
@@ -143,7 +143,7 @@ Authorization: Bearer <token>
 | ช่องทางขาย | `GET/POST /api/channels`, `PUT /api/channels/:id` | Admin/Staff อ่าน, Admin จัดการ |
 | การเงิน | `GET /api/financial-summary`, `GET /api/sales-breakdown`, `GET /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD`, `GET/POST /api/daily-closings`, `GET/POST/PUT/DELETE /api/expenses` | Admin |
 | คูปอง | `POST /api/coupons/validate`, `GET/POST/PUT /api/coupons` | Staff/Admin, Admin |
-| สมาชิก/แต้มสะสม | `POST /api/loyalty/lookup`, `GET /api/loyalty/me` | Staff/Admin ค้นหา, User ดูของตน |
+| สมาชิก/คะแนนสะสม | `GET/PUT /api/loyalty/settings`, `POST /api/loyalty/lookup`, `GET /api/loyalty/me` | Admin ตั้งค่า, Staff/Admin ค้นหา, User ดูของตน |
 | กะเงินสด | `GET /api/shifts/current`, `POST /api/shifts/open`, `POST /api/shifts/:id/close`, `GET /api/shifts` | Admin/Staff, Admin |
 | ผู้ขาย/รับของเข้า | `GET/POST/PUT /api/inventory/suppliers`, `GET/POST /api/inventory/receipts`, `GET /api/inventory/lots`, `GET /api/inventory/movements` | Admin |
 | ใบสั่งซื้อ | `GET/POST /api/purchase-orders`, `PATCH /api/purchase-orders/:id/status`, `POST /api/purchase-orders/:id/receive` | Admin |

@@ -132,16 +132,53 @@ const isValidPhone = (value) => /^\d{9,15}$/.test(value);
 const publicUser = (user) => ({ id: Number(user.id), username: user.username, name: user.full_name, phone: user.phone || '', role: String(user.role).toLowerCase() });
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
-const LOYALTY_BAHT_PER_POINT = 0.1;
-const LOYALTY_SPEND_PER_POINT = 25;
-const LOYALTY_MAX_REDEEM_RATIO = 0.5;
-const loyaltyPointsForAmount = (amount) => Math.floor(Math.max(0, Number(amount) || 0) / LOYALTY_SPEND_PER_POINT);
-const loyaltyDiscountForPoints = (points) => Number((Math.max(0, Number(points) || 0) * LOYALTY_BAHT_PER_POINT).toFixed(2));
-const loyaltyRules = () => ({
-  spend_per_point: LOYALTY_SPEND_PER_POINT,
-  baht_per_point: LOYALTY_BAHT_PER_POINT,
-  max_redeem_percent: LOYALTY_MAX_REDEEM_RATIO * 100,
+const DEFAULT_LOYALTY_RULES = Object.freeze({
+  is_enabled: true,
+  spend_per_point: 25,
+  baht_per_point: 0.1,
+  max_redeem_percent: 50,
 });
+const loyaltyRules = (settings = DEFAULT_LOYALTY_RULES) => ({
+  is_enabled: settings.is_enabled !== false,
+  spend_per_point: Number(settings.spend_per_point || DEFAULT_LOYALTY_RULES.spend_per_point),
+  baht_per_point: Number(settings.baht_per_point || DEFAULT_LOYALTY_RULES.baht_per_point),
+  max_redeem_percent: Number(settings.max_redeem_percent ?? DEFAULT_LOYALTY_RULES.max_redeem_percent),
+});
+const loyaltyPointsForAmount = (amount, rules) => Math.floor(
+  Math.max(0, Number(amount) || 0) / loyaltyRules(rules).spend_per_point,
+);
+const loyaltyDiscountForPoints = (points, rules) => Number((
+  Math.max(0, Number(points) || 0) * loyaltyRules(rules).baht_per_point
+).toFixed(2));
+const getLoyaltyRules = async (client = pool, { forUpdate = false } = {}) => {
+  const result = await client.query(
+    `SELECT is_enabled, spend_per_point, baht_per_point, max_redeem_percent, updated_at
+     FROM loyalty_settings WHERE id = 1${forUpdate ? ' FOR UPDATE' : ''}`,
+  );
+  return loyaltyRules(result.rows[0]);
+};
+const validateLoyaltySettings = (value = {}) => {
+  const isEnabled = value.is_enabled;
+  const spendPerPoint = Number(value.spend_per_point);
+  const bahtPerPoint = Number(value.baht_per_point);
+  const maxRedeemPercent = Number(value.max_redeem_percent);
+  if (typeof isEnabled !== 'boolean') throw requestError('Loyalty enabled setting must be true or false');
+  if (!Number.isFinite(spendPerPoint) || spendPerPoint < 0.01 || spendPerPoint > 1000000) {
+    throw requestError('Spend per point must be between 0.01 and 1,000,000');
+  }
+  if (!Number.isFinite(bahtPerPoint) || bahtPerPoint < 0.01 || bahtPerPoint > 100000) {
+    throw requestError('Discount value per point must be between 0.01 and 100,000');
+  }
+  if (!Number.isFinite(maxRedeemPercent) || maxRedeemPercent < 0 || maxRedeemPercent > 100) {
+    throw requestError('Maximum redemption percentage must be between 0 and 100');
+  }
+  return {
+    is_enabled: isEnabled,
+    spend_per_point: Number(spendPerPoint.toFixed(2)),
+    baht_per_point: Number(bahtPerPoint.toFixed(2)),
+    max_redeem_percent: Number(maxRedeemPercent.toFixed(2)),
+  };
+};
 const loyaltyAccountPayload = (account) => account ? ({
   id: Number(account.id),
   customer_phone: account.customer_phone,
@@ -303,6 +340,22 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_nickname VARCHAR(80)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS queue_no INTEGER');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS loyalty_settings (
+        id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        spend_per_point NUMERIC(12, 2) NOT NULL DEFAULT 25 CHECK (spend_per_point > 0),
+        baht_per_point NUMERIC(12, 2) NOT NULL DEFAULT 0.10 CHECK (baht_per_point > 0),
+        max_redeem_percent NUMERIC(5, 2) NOT NULL DEFAULT 50 CHECK (max_redeem_percent >= 0 AND max_redeem_percent <= 100),
+        updated_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      INSERT INTO loyalty_settings (id)
+      VALUES (1)
+      ON CONFLICT (id) DO NOTHING
+    `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS loyalty_accounts (
         id BIGSERIAL PRIMARY KEY,
@@ -899,17 +952,49 @@ app.put('/api/admin/go-live-checks/:key', requireAuth, requireRoles('ADMIN'), as
   }
 });
 
+app.get('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    res.json({ success: true, data: await getLoyaltyRules() });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const settings = validateLoyaltySettings(req.body);
+    const result = await pool.query(
+      `UPDATE loyalty_settings
+       SET is_enabled = $1, spend_per_point = $2, baht_per_point = $3,
+           max_redeem_percent = $4, updated_by = $5, updated_at = CURRENT_TIMESTAMP
+       WHERE id = 1
+       RETURNING is_enabled, spend_per_point, baht_per_point, max_redeem_percent, updated_at`,
+      [
+        settings.is_enabled,
+        settings.spend_per_point,
+        settings.baht_per_point,
+        settings.max_redeem_percent,
+        req.user.sub,
+      ],
+    );
+    res.json({ success: true, data: loyaltyRules(result.rows[0]) });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/loyalty/me', requireAuth, requireRoles('USER'), async (req, res) => {
   try {
+    const rules = await getLoyaltyRules();
     const userResult = await pool.query('SELECT phone FROM users WHERE id = $1', [req.user.sub]);
     const phone = userResult.rows[0]?.phone || '';
-    if (!phone) return res.json({ success: true, data: { account: null, rules: loyaltyRules() } });
+    if (!phone) return res.json({ success: true, data: { account: null, rules } });
     const result = await pool.query(
       `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at
        FROM loyalty_accounts WHERE customer_phone = $1`,
       [phone]
     );
-    res.json({ success: true, data: { account: loyaltyAccountPayload(result.rows[0]), rules: loyaltyRules() } });
+    res.json({ success: true, data: { account: loyaltyAccountPayload(result.rows[0]), rules } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -919,12 +1004,13 @@ app.post('/api/loyalty/lookup', requireAuth, requireRoles('ADMIN', 'STAFF'), pro
   const phone = normalizePhone(req.body?.phone);
   if (!isValidPhone(phone)) return res.status(400).json({ success: false, error: 'Customer phone number is invalid' });
   try {
+    const rules = await getLoyaltyRules();
     const result = await pool.query(
       `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at
        FROM loyalty_accounts WHERE customer_phone = $1`,
       [phone]
     );
-    res.json({ success: true, data: { account: loyaltyAccountPayload(result.rows[0]), rules: loyaltyRules() } });
+    res.json({ success: true, data: { account: loyaltyAccountPayload(result.rows[0]), rules } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1984,10 +2070,16 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
     }
 
     const loyaltyBaseAmount = Math.max(0, couponBaseAmount - couponDiscountAmount);
+    // Read the single settings row inside the order transaction. This makes every
+    // earn/redeem calculation use the current admin-configured rules, not client input.
+    const currentLoyaltyRules = await getLoyaltyRules(client, { forUpdate: true });
     let loyaltyAccount = null;
     let loyaltyPointsRedeemed = 0;
     let loyaltyDiscountAmount = 0;
-    if (customerPhone) {
+    if (!currentLoyaltyRules.is_enabled && requestedLoyaltyPoints > 0) {
+      throw requestError('Loyalty redemption is currently disabled', 409);
+    }
+    if (currentLoyaltyRules.is_enabled && customerPhone) {
       const accountResult = await client.query(
         `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at
          FROM loyalty_accounts WHERE customer_phone = $1 FOR UPDATE`,
@@ -2007,11 +2099,13 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
       }
       if (requestedLoyaltyPoints > 0) {
         const availablePoints = Math.max(0, Number(loyaltyAccount.points_balance || 0));
-        const maxRedeemPoints = Math.floor((loyaltyBaseAmount * LOYALTY_MAX_REDEEM_RATIO) / LOYALTY_BAHT_PER_POINT);
+        const maxRedeemPoints = Math.floor(
+          (loyaltyBaseAmount * (currentLoyaltyRules.max_redeem_percent / 100)) / currentLoyaltyRules.baht_per_point,
+        );
         if (requestedLoyaltyPoints > availablePoints) throw requestError('Customer does not have enough loyalty points', 409);
         if (requestedLoyaltyPoints > maxRedeemPoints) throw requestError(`This order can redeem at most ${maxRedeemPoints} points`, 400);
         loyaltyPointsRedeemed = requestedLoyaltyPoints;
-        loyaltyDiscountAmount = loyaltyDiscountForPoints(loyaltyPointsRedeemed);
+        loyaltyDiscountAmount = loyaltyDiscountForPoints(loyaltyPointsRedeemed, currentLoyaltyRules);
       }
     } else if (requestedLoyaltyPoints > 0) {
       throw requestError('A customer phone number is required to redeem loyalty points');
@@ -2019,7 +2113,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req,
 
     const discountAmount = manualDiscountAmount + couponDiscountAmount + loyaltyDiscountAmount;
     const grossAmount = Math.max(0, subtotalAmount - discountAmount);
-    const loyaltyPointsEarned = loyaltyAccount ? loyaltyPointsForAmount(grossAmount) : 0;
+    const loyaltyPointsEarned = loyaltyAccount ? loyaltyPointsForAmount(grossAmount, currentLoyaltyRules) : 0;
 
     const paidAmount = grossAmount;
     let amountReceived = paidAmount;
