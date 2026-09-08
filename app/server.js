@@ -133,7 +133,7 @@ const publicUser = (user) => ({ id: Number(user.id), username: user.username, na
 const normalizeCouponCode = (value) => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 const requestError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const ROLE_PERMISSION_DEFAULTS = Object.freeze({
-  ADMIN: Object.fromEntries(['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'role-permissions', 'printing', 'finance', 'business-reports'].map((menu) => [menu, { view: true, create: true, update: true, delete: true }])),
+  ADMIN: Object.fromEntries(['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'role-permissions', 'audit-logs', 'printing', 'finance', 'business-reports'].map((menu) => [menu, { view: true, create: true, update: true, delete: true }])),
   STAFF: { pos: { view: true, create: true, update: true, delete: false }, orders: { view: true, create: false, update: true, delete: false }, kitchen: { view: true, create: false, update: true, delete: false }, 'cash-shifts': { view: true, create: true, update: true, delete: false }, menu: { view: true, create: false, update: false, delete: false }, 'sales-channels': { view: true, create: false, update: false, delete: false } },
   USER: { orders: { view: true, create: false, update: false, delete: false } },
 });
@@ -157,7 +157,7 @@ const requirePermission = (menu, action) => async (req, res, next) => {
   }
 };
 const permissionActions = ['view', 'create', 'update', 'delete'];
-const permissionMenus = ['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'role-permissions', 'printing', 'finance', 'business-reports'];
+const permissionMenus = ['operations', 'pos', 'orders', 'kitchen', 'cash-shifts', 'alerts', 'inventory', 'menu', 'procurement', 'sales-channels', 'coupons', 'loyalty-settings', 'loyalty-members', 'role-permissions', 'audit-logs', 'printing', 'finance', 'business-reports'];
 const sanitizePermissions = (value) => Object.fromEntries(permissionMenus.map((menu) => [
   menu,
   Object.fromEntries(permissionActions.map((action) => [action, value?.[menu]?.[action] === true])),
@@ -274,7 +274,7 @@ const recordAuditLog = (req, statusCode) => {
       req.method,
       pathParts.slice(0, 2).join('/') || req.path,
       resourceId,
-      JSON.stringify(auditPayload(req.body || {})),
+      JSON.stringify(auditPayload(req.auditSummary ?? req.body ?? {})),
       statusCode,
       String(req.ip || '').slice(0, 100),
     ],
@@ -472,6 +472,7 @@ const startServer = async () => {
     await client.query('CREATE INDEX IF NOT EXISTS orders_loyalty_account_idx ON orders(loyalty_account_id)');
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS is_sold_out BOOLEAN NOT NULL DEFAULT FALSE');
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS barcode VARCHAR(80)');
+    await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS counts_as_loyalty_cup BOOLEAN NOT NULL DEFAULT FALSE');
     await client.query('CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx ON products(barcode) WHERE barcode IS NOT NULL');
     await client.query(`
       CREATE TABLE IF NOT EXISTS product_channel_settings (
@@ -984,13 +985,21 @@ app.get('/api/admin/backups/export', requireAuth, requireRoles('ADMIN'), async (
 });
 
 // GET /api/admin/audit-logs - ประวัติการแก้ไขและการทำรายการสำคัญ
-app.get('/api/admin/audit-logs', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+app.get('/api/admin/audit-logs', requireAuth, requireRoles('ADMIN'), requirePermission('audit-logs', 'view'), async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query?.limit) || 30));
+  const scope = String(req.query?.scope || 'all').toLowerCase();
+  const importantOnly = scope === 'important';
   try {
     const result = await pool.query(
       `SELECT al.*, COALESCE(u.full_name, NULLIF(al.actor_username, ''), 'ระบบ') AS actor_name
        FROM audit_logs al
        LEFT JOIN users u ON u.id = al.actor_user_id
+       ${importantOnly ? `WHERE al.status_code BETWEEN 200 AND 299 AND (
+         (al.resource = 'admin/loyalty-members' AND al.action IN ('PUT', 'DELETE'))
+         OR (al.resource = 'admin/users' AND al.action = 'PUT' AND al.request_summary ? 'role_key')
+         OR (al.resource LIKE 'products/%' AND al.action = 'PUT' AND al.request_summary ->> 'price_changed' = 'true')
+         OR (al.resource LIKE 'orders/%' AND al.action = 'PUT')
+       )` : ''}
        ORDER BY al.created_at DESC, al.id DESC
        LIMIT $1`,
       [limit],
@@ -2273,9 +2282,8 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
       if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
         throw requestError('Order item quantity and price are invalid');
       }
-      totalCups += quantity;
       const productResult = await client.query(
-        `SELECT p.id, p.name, p.is_sold_out, p.price_retail,
+        `SELECT p.id, p.name, p.is_sold_out, p.counts_as_loyalty_cup, p.price_retail,
                 pcs.is_active AS channel_is_active, pcs.price_retail AS channel_price_retail
          FROM products p
          LEFT JOIN product_channel_settings pcs
@@ -2287,6 +2295,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
       const product = productResult.rows[0];
       if (!product) throw requestError('Product not found', 404);
       if (product.is_sold_out) throw requestError(`${product.name} is temporarily unavailable`, 409);
+      if (product.counts_as_loyalty_cup === true) totalCups += quantity;
       if (product.channel_is_active === false) {
         throw requestError(`${product.name} is not available for this sales channel`, 409);
       }
