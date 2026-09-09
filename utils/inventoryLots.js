@@ -1,5 +1,9 @@
-const roundQuantity = (value) => Number(Number(value || 0).toFixed(3));
-const roundCost = (value) => Number(Number(value || 0).toFixed(4));
+const finiteNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+const roundQuantity = (value) => Number(finiteNumber(value).toFixed(3));
+const roundCost = (value) => Number(finiteNumber(value).toFixed(4));
 
 const automaticLotNo = (prefix = 'LOT') =>
   `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
