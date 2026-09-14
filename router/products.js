@@ -12,6 +12,29 @@ const normalizeBarcode = (value) => {
   return barcode || null;
 };
 
+const normalizeImageUrl = (value) => {
+  const imageUrl = String(value || '').trim();
+  if (!imageUrl) return null;
+  if (imageUrl.length > 2048) throw new Error('Image URL is too long');
+  try {
+    const parsed = new URL(imageUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Invalid image URL');
+    return parsed.toString();
+  } catch {
+    throw new Error('Image URL must be a valid http or https URL');
+  }
+};
+
+const normalizeImageData = (value) => {
+  const imageData = String(value || '').trim();
+  if (!imageData) return null;
+  if (imageData.length > 160000) throw new Error('Uploaded image is too large');
+  if (!/^data:image\/webp;base64,[A-Za-z0-9+/]+={0,2}$/.test(imageData)) {
+    throw new Error('Uploaded image must be a WebP image');
+  }
+  return imageData;
+};
+
 const normalizeChannelSettings = (settings) => {
   if (settings === undefined) return null;
   if (!Array.isArray(settings)) throw new Error('Channel settings must be a list');
@@ -243,15 +266,19 @@ router.patch('/:id/availability', async (req, res) => {
 
 // 📌 POST /api/products - เพิ่มสินค้าใหม่
 router.post('/', async (req, res) => {
-  const { name, category, barcode, price_retail, price_wholesale, counts_as_loyalty_cup, recipe = [], modifiers = [], channel_settings } = req.body;
+  const { name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup, recipe = [], modifiers = [], channel_settings } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
   let normalizedModifiers;
   let normalizedChannelSettings;
+  let normalizedImageUrl;
+  let normalizedImageData;
   try {
     normalizedModifiers = normalizeModifiers(modifiers);
     normalizedChannelSettings = normalizeChannelSettings(channel_settings);
+    normalizedImageUrl = normalizeImageUrl(image_url);
+    normalizedImageData = normalizeImageData(image_data);
   } catch (error) {
     return res.status(400).json({ success: false, error: error.message });
   }
@@ -259,9 +286,9 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN');
     const result = await client.query(
-      `INSERT INTO products (name, category, barcode, price_retail, price_wholesale, counts_as_loyalty_cup)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [name, category, normalizeBarcode(barcode), price_retail, price_wholesale || null, counts_as_loyalty_cup === true]
+      `INSERT INTO products (name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [name, category, normalizeBarcode(barcode), normalizedImageUrl, normalizedImageData, price_retail, price_wholesale || null, counts_as_loyalty_cup === true]
     );
     for (const ingredient of recipe) {
       await client.query(
@@ -284,15 +311,19 @@ router.post('/', async (req, res) => {
 
 // PUT /api/products/:id - แก้ไขเมนูและสูตรวัตถุดิบ
 router.put('/:id', async (req, res) => {
-  const { name, category, barcode, price_retail, price_wholesale, counts_as_loyalty_cup, recipe = [], modifiers = [], channel_settings } = req.body;
+  const { name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup, recipe = [], modifiers = [], channel_settings } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
   let normalizedModifiers;
   let normalizedChannelSettings;
+  let normalizedImageUrl;
+  let normalizedImageData;
   try {
     normalizedModifiers = normalizeModifiers(modifiers);
     normalizedChannelSettings = normalizeChannelSettings(channel_settings);
+    normalizedImageUrl = normalizeImageUrl(image_url);
+    normalizedImageData = normalizeImageData(image_data);
   } catch (error) {
     return res.status(400).json({ success: false, error: error.message });
   }
@@ -313,9 +344,9 @@ router.put('/:id', async (req, res) => {
       price_changed: Math.abs(Number(existing.rows[0].price_retail || 0) - Number(price_retail)) > 0.000001,
     };
     const result = await client.query(
-      `UPDATE products SET name = $1, category = $2, barcode = $3, price_retail = $4, price_wholesale = $5, counts_as_loyalty_cup = $6
-       WHERE id = $7 RETURNING *`,
-      [name, category, normalizeBarcode(barcode), price_retail, price_wholesale || null, counts_as_loyalty_cup === true, req.params.id]
+      `UPDATE products SET name = $1, category = $2, barcode = $3, image_url = $4, image_data = $5, price_retail = $6, price_wholesale = $7, counts_as_loyalty_cup = $8
+       WHERE id = $9 RETURNING *`,
+      [name, category, normalizeBarcode(barcode), normalizedImageUrl, normalizedImageData, price_retail, price_wholesale || null, counts_as_loyalty_cup === true, req.params.id]
     );
     if (!result.rows.length) {
       await client.query('ROLLBACK');
