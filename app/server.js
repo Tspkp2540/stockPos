@@ -2365,10 +2365,9 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
            FOR UPDATE`,
           [req.user.sub]
         );
-        if (!activeShift.rows.length) {
-          throw requestError('Open a cash shift before accepting a cash payment', 409);
-        }
-        cashShiftId = activeShift.rows[0].id;
+        // A cash sale may be recorded without an open shift. In that case the
+        // payment remains traceable but is intentionally not assigned to a shift.
+        cashShiftId = activeShift.rows[0]?.id || null;
       }
     }
 
