@@ -379,11 +379,16 @@ router.delete('/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     await client.query('DELETE FROM recipes WHERE product_id = $1', [req.params.id]);
-    const result = await client.query('DELETE FROM products WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await client.query(
+      `DELETE FROM products WHERE id = $1
+       RETURNING id, name, category, barcode, price_retail, price_wholesale, counts_as_loyalty_cup, is_sold_out`,
+      [req.params.id],
+    );
     if (!result.rows.length) {
       await client.query('ROLLBACK');
       return res.status(404).json({ success: false, error: 'Product not found' });
     }
+    req.auditSummary = { deleted: result.rows[0] };
     await client.query('COMMIT');
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {

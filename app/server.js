@@ -910,20 +910,49 @@ app.get('/api/admin/audit-logs', requireAuth, requireRoles('ADMIN'), requirePerm
   const limit = Math.min(200, Math.max(1, Number(req.query?.limit) || 30));
   const scope = String(req.query?.scope || 'all').toLowerCase();
   const importantOnly = scope === 'important';
+  const search = String(req.query?.search || '').trim().slice(0, 160);
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.from || '')) ? String(req.query.from) : null;
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.to || '')) ? String(req.query.to) : null;
   try {
+    const conditions = [];
+    const params = [];
+    if (importantOnly) {
+      conditions.push(`al.status_code BETWEEN 200 AND 299 AND (
+        (al.resource = 'admin/loyalty-members' AND al.action IN ('PUT', 'DELETE'))
+        OR (al.resource = 'admin/users' AND al.action = 'PUT' AND al.request_summary ? 'role_key')
+        OR (al.resource LIKE 'products/%' AND al.action IN ('PUT', 'DELETE') AND (al.request_summary ->> 'price_changed' = 'true' OR al.action = 'DELETE'))
+        OR (al.resource LIKE 'orders/%' AND al.action IN ('PUT', 'DELETE'))
+      )`);
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      const searchParam = `$${params.length}`;
+      conditions.push(`(
+        al.actor_username ILIKE ${searchParam}
+        OR COALESCE(u.full_name, '') ILIKE ${searchParam}
+        OR al.action ILIKE ${searchParam}
+        OR al.resource ILIKE ${searchParam}
+        OR COALESCE(al.resource_id, '') ILIKE ${searchParam}
+        OR al.request_summary::text ILIKE ${searchParam}
+      )`);
+    }
+    if (from) {
+      params.push(from);
+      conditions.push(`(al.created_at AT TIME ZONE 'Asia/Bangkok')::date >= $${params.length}::date`);
+    }
+    if (to) {
+      params.push(to);
+      conditions.push(`(al.created_at AT TIME ZONE 'Asia/Bangkok')::date <= $${params.length}::date`);
+    }
+    params.push(limit);
     const result = await pool.query(
       `SELECT al.*, COALESCE(u.full_name, NULLIF(al.actor_username, ''), 'ระบบ') AS actor_name
        FROM audit_logs al
        LEFT JOIN users u ON u.id = al.actor_user_id
-       ${importantOnly ? `WHERE al.status_code BETWEEN 200 AND 299 AND (
-         (al.resource = 'admin/loyalty-members' AND al.action IN ('PUT', 'DELETE'))
-         OR (al.resource = 'admin/users' AND al.action = 'PUT' AND al.request_summary ? 'role_key')
-         OR (al.resource LIKE 'products/%' AND al.action = 'PUT' AND al.request_summary ->> 'price_changed' = 'true')
-         OR (al.resource LIKE 'orders/%' AND al.action = 'PUT')
-       )` : ''}
+       ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
        ORDER BY al.created_at DESC, al.id DESC
-       LIMIT $1`,
-      [limit],
+       LIMIT $${params.length}`,
+      params,
     );
     res.json({ success: true, data: result.rows });
   } catch (error) {
@@ -1028,8 +1057,12 @@ app.delete('/api/admin/role-permissions/:role', requireAuth, requireRoles('ADMIN
     await client.query('BEGIN');
     const assigned = await client.query('SELECT COUNT(*)::int AS total FROM users WHERE role_key = $1 FOR UPDATE', [role]);
     if (Number(assigned.rows[0]?.total || 0)) throw requestError('Move users out of this role before deleting it', 409);
-    const deleted = await client.query('DELETE FROM role_permissions WHERE role = $1 RETURNING role', [role]);
+    const deleted = await client.query(
+      'DELETE FROM role_permissions WHERE role = $1 RETURNING role, base_role, display_name, permissions',
+      [role],
+    );
     if (!deleted.rows.length) throw requestError('Role not found', 404);
+    req.auditSummary = { deleted: deleted.rows[0] };
     await client.query('COMMIT');
     res.json({ success: true, data: deleted.rows[0] });
   } catch (error) {
@@ -1235,8 +1268,13 @@ app.put('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), re
 
 app.delete('/api/admin/loyalty-members/:id', requireAuth, requireRoles('ADMIN'), requirePermission('loyalty-members', 'delete'), async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM loyalty_accounts WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await pool.query(
+      `DELETE FROM loyalty_accounts WHERE id = $1
+       RETURNING id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, order_count, last_order_at`,
+      [req.params.id],
+    );
     if (!result.rows.length) return res.status(404).json({ success: false, error: 'Member not found' });
+    req.auditSummary = { deleted: result.rows[0] };
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -2063,7 +2101,8 @@ app.put('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), requirePermissi
   }
   try {
     const existing = await pool.query(
-      `SELECT DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date
+      `SELECT id, amount, category, description, created_at,
+              DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date
        FROM expenses WHERE id = $1`,
       [req.params.id]
     );
@@ -2096,6 +2135,7 @@ app.delete('/api/expenses/:id', requireAuth, requireRoles('ADMIN'), requirePermi
     if (!existing.rows.length) return res.status(404).json({ success: false, error: 'Expense not found' });
     await assertBusinessDateOpen(pool, existing.rows[0].business_date);
     const result = await pool.query('DELETE FROM expenses WHERE id = $1 RETURNING id', [req.params.id]);
+    req.auditSummary = { deleted: existing.rows[0] };
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(error.statusCode || 500).json({ success: false, error: error.message });
@@ -2640,13 +2680,32 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
   try {
     await client.query('BEGIN');
     const orderResult = await client.query(
-      `SELECT id, status, DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date,
+      `SELECT id, order_no, channel_id, status, gross_amount, net_revenue, customer_name, customer_nickname,
+              customer_phone, queue_no, created_at, DATE(created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date,
               loyalty_account_id, loyalty_points_earned, loyalty_points_redeemed
        FROM orders WHERE id = $1 FOR UPDATE`,
       [id]
     );
     if (!orderResult.rows.length) throw new Error('Order not found');
     await assertBusinessDateOpen(client, orderResult.rows[0].business_date);
+    const deletedItems = await client.query(
+      `SELECT oi.product_id, p.name, oi.quantity, oi.unit_price,
+              COALESCE((
+                SELECT JSON_AGG(JSON_BUILD_OBJECT('group_name', oim.group_name, 'option_name', oim.option_name) ORDER BY oim.id)
+                FROM order_item_modifiers oim WHERE oim.order_item_id = oi.id
+              ), '[]'::json) AS modifiers
+       FROM order_items oi
+       LEFT JOIN products p ON p.id = oi.product_id
+       WHERE oi.order_id = $1
+       ORDER BY oi.id`,
+      [id],
+    );
+    req.auditSummary = {
+      deleted: {
+        ...orderResult.rows[0],
+        items: deletedItems.rows,
+      },
+    };
     if (orderResult.rows[0].status !== 'CANCELLED') {
       const previousIngredients = await client.query(
         `SELECT r.ingredient_id, SUM(r.quantity_used * oi.quantity) AS quantity_to_restore,

@@ -415,8 +415,13 @@ router.put('/:id', async (req, res) => {
 // DELETE /api/inventory/:id - ลบวัตถุดิบ
 router.delete('/:id', async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM ingredients WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await pool.query(
+      `DELETE FROM ingredients WHERE id = $1
+       RETURNING id, name, unit, stock_qty, cost_per_unit, min_stock_alert, expiry_date`,
+      [req.params.id],
+    );
     if (!result.rows.length) return res.status(404).json({ success: false, error: 'Ingredient not found' });
+    req.auditSummary = { deleted: result.rows[0] };
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
