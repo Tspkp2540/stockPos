@@ -16,6 +16,255 @@ const assertBusinessDateOpen = async (client, businessDate) => {
   }
 };
 
+const roundMoney = (value) => Number((Number(value) || 0).toFixed(2));
+const roundQuantity = (value) => Number((Number(value) || 0).toFixed(3));
+
+// คืนสินค้าได้ทั้งบางรายการและทั้งหมด โดยใช้ล็อตเดิมที่ถูกตัดออกจากออเดอร์
+// เพื่อให้สต็อกและต้นทุนกลับไปยังล็อตที่ถูกต้องเสมอ
+router.post('/:id/returns', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const orderId = Number(req.params.id);
+  const reason = String(req.body?.reason || '').trim().slice(0, 500);
+  const requestedItems = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!Number.isInteger(orderId) || orderId <= 0 || !requestedItems.length) {
+    return res.status(400).json({ success: false, error: 'กรุณาเลือกรายการที่ต้องการคืนสินค้า' });
+  }
+
+  const quantities = new Map();
+  for (const input of requestedItems) {
+    const orderItemId = Number(input?.order_item_id);
+    const quantity = Number(input?.quantity);
+    if (!Number.isInteger(orderItemId) || !Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({ success: false, error: 'จำนวนสินค้าเพื่อคืนไม่ถูกต้อง' });
+    }
+    quantities.set(orderItemId, roundQuantity((quantities.get(orderItemId) || 0) + quantity));
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const orderResult = await client.query(
+      `SELECT o.id, o.order_no, o.status, o.subtotal_amount, o.gross_amount, o.loyalty_account_id,
+              o.loyalty_points_earned, o.loyalty_points_redeemed, o.coupon_id, o.created_at,
+              DATE(o.created_at AT TIME ZONE 'Asia/Bangkok')::text AS business_date,
+              op.payment_method, op.status AS payment_status
+       FROM orders o
+       JOIN order_payments op ON op.order_id = o.id
+       WHERE o.id = $1
+       FOR UPDATE OF o, op`,
+      [orderId]
+    );
+    const order = orderResult.rows[0];
+    if (!order) throw Object.assign(new Error('ไม่พบคำสั่งซื้อหรือข้อมูลการชำระเงิน'), { statusCode: 404 });
+    await assertBusinessDateOpen(client, order.business_date);
+    if (['CANCELLED', 'RETURNED'].includes(order.status)) {
+      throw Object.assign(new Error('คำสั่งซื้อนี้ไม่สามารถคืนสินค้าได้'), { statusCode: 409 });
+    }
+    if (order.payment_status !== 'PAID') {
+      throw Object.assign(new Error('คำสั่งซื้อนี้ยังไม่ได้ชำระเงิน จึงไม่สามารถคืนเงินได้'), { statusCode: 409 });
+    }
+
+    const itemResult = await client.query(
+      `SELECT oi.id, oi.product_id, oi.quantity, oi.unit_price, oi.subtotal, COALESCE(p.name, 'เมนูที่ถูกลบ') AS product_name,
+              COALESCE((
+                SELECT SUM(ori.quantity)
+                FROM order_return_items ori
+                JOIN order_returns previous_return ON previous_return.id = ori.return_id
+                WHERE ori.order_item_id = oi.id
+              ), 0) AS returned_quantity
+       FROM order_items oi
+       LEFT JOIN products p ON p.id = oi.product_id
+       WHERE oi.order_id = $1
+       FOR UPDATE OF oi`,
+      [orderId]
+    );
+    const itemsById = new Map(itemResult.rows.map((item) => [Number(item.id), item]));
+    let returnSubtotal = 0;
+    for (const [orderItemId, quantity] of quantities) {
+      const item = itemsById.get(orderItemId);
+      if (!item) throw Object.assign(new Error('พบรายการสินค้าที่ไม่อยู่ในคำสั่งซื้อนี้'), { statusCode: 400 });
+      const available = roundQuantity(Number(item.quantity) - Number(item.returned_quantity || 0));
+      if (quantity > available + 0.000001) {
+        throw Object.assign(new Error(`${item.product_name} คืนได้อีกไม่เกิน ${available}`), { statusCode: 409 });
+      }
+      returnSubtotal += quantity * Number(item.unit_price || 0);
+    }
+    if (returnSubtotal <= 0 || Number(order.gross_amount || 0) <= 0) {
+      throw Object.assign(new Error('ยอดคืนเงินต้องมากกว่า 0'), { statusCode: 400 });
+    }
+
+    const previousReturnsResult = await client.query(
+      `SELECT COALESCE(SUM(refund_amount), 0) AS refund_amount,
+              COALESCE(SUM(points_earned_reversed), 0) AS points_earned_reversed,
+              COALESCE(SUM(points_redeemed_restored), 0) AS points_redeemed_restored
+       FROM order_returns WHERE order_id = $1`,
+      [orderId]
+    );
+    const previousReturns = previousReturnsResult.rows[0];
+    const priorRefundAmount = Number(previousReturns.refund_amount || 0);
+    const remainingRefundAmount = roundMoney(Number(order.gross_amount) - priorRefundAmount);
+    const allItemsFullyReturned = itemResult.rows.every((item) =>
+      roundQuantity(Number(item.returned_quantity || 0) + Number(quantities.get(Number(item.id)) || 0)) >= Number(item.quantity) - 0.000001
+    );
+    const ratio = Number(order.subtotal_amount || 0) > 0
+      ? Math.min(1, returnSubtotal / Number(order.subtotal_amount))
+      : 0;
+    let refundAmount = roundMoney(Number(order.gross_amount) * ratio);
+    refundAmount = allItemsFullyReturned ? remainingRefundAmount : Math.min(refundAmount, remainingRefundAmount);
+    if (refundAmount <= 0 || refundAmount > remainingRefundAmount + 0.005) {
+      throw Object.assign(new Error('ยอดคืนเงินเกินกว่ายอดที่ชำระไว้'), { statusCode: 409 });
+    }
+
+    let cashShiftId = null;
+    if (order.payment_method === 'CASH') {
+      const activeShift = await client.query(
+        `SELECT id FROM cash_shifts WHERE opened_by = $1 AND status = 'OPEN' FOR UPDATE`,
+        [req.user.sub]
+      );
+      cashShiftId = activeShift.rows[0]?.id || null;
+    }
+    const returnNo = `RET-${order.id}-${Date.now().toString(36).toUpperCase()}`;
+    const returnResult = await client.query(
+      `INSERT INTO order_returns (return_no, order_id, cash_shift_id, returned_by, refund_method, refund_amount, reason)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [returnNo, orderId, cashShiftId, req.user.sub, order.payment_method, refundAmount, reason]
+    );
+    const returnRecord = returnResult.rows[0];
+    let allocatedRefund = 0;
+    let restoredCogs = 0;
+    const returnedDetails = [];
+    const quantityEntries = [...quantities.entries()];
+
+    for (let index = 0; index < quantityEntries.length; index += 1) {
+      const [orderItemId, quantity] = quantityEntries[index];
+      const item = itemsById.get(orderItemId);
+      const itemSubtotal = quantity * Number(item.unit_price || 0);
+      const itemRefund = index === quantityEntries.length - 1
+        ? roundMoney(refundAmount - allocatedRefund)
+        : roundMoney(refundAmount * (itemSubtotal / returnSubtotal));
+      allocatedRefund += itemRefund;
+      const returnItemResult = await client.query(
+        `INSERT INTO order_return_items (return_id, order_item_id, product_id, product_name, quantity, unit_price, refund_amount)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [returnRecord.id, item.id, item.product_id, item.product_name, quantity, item.unit_price, itemRefund]
+      );
+      const returnItem = returnItemResult.rows[0];
+      const priorReturnedQuantity = Number(item.returned_quantity || 0);
+      const cumulativeReturnedQuantity = roundQuantity(priorReturnedQuantity + quantity);
+      const allocations = await client.query(
+        `SELECT oila.id, oila.inventory_lot_id, oila.quantity, oila.unit_cost, il.ingredient_id
+         FROM order_item_lot_allocations oila
+         JOIN inventory_lots il ON il.id = oila.inventory_lot_id
+         WHERE oila.order_item_id = $1
+         FOR UPDATE OF il`,
+        [item.id]
+      );
+      for (const allocation of allocations.rows) {
+        const previouslyRestored = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0) AS quantity
+           FROM order_return_lot_restorations WHERE order_item_lot_allocation_id = $1`,
+          [allocation.id]
+        );
+        const targetRestore = roundQuantity(
+          Number(allocation.quantity) * cumulativeReturnedQuantity / Number(item.quantity)
+        );
+        const restoreQuantity = roundQuantity(targetRestore - Number(previouslyRestored.rows[0].quantity || 0));
+        if (restoreQuantity <= 0) continue;
+        await client.query(
+          `UPDATE inventory_lots
+           SET remaining_quantity = remaining_quantity + $1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2`,
+          [restoreQuantity, allocation.inventory_lot_id]
+        );
+        await client.query(
+          `UPDATE ingredients SET stock_qty = stock_qty + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+          [restoreQuantity, allocation.ingredient_id]
+        );
+        await client.query(
+          `INSERT INTO order_return_lot_restorations
+           (return_item_id, order_item_lot_allocation_id, inventory_lot_id, quantity, unit_cost)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [returnItem.id, allocation.id, allocation.inventory_lot_id, restoreQuantity, allocation.unit_cost]
+        );
+        restoredCogs += restoreQuantity * Number(allocation.unit_cost || 0);
+      }
+      returnedDetails.push({ ...returnItem, product_name: item.product_name });
+    }
+
+    const cumulativeRefund = roundMoney(priorRefundAmount + refundAmount);
+    const originalGross = Number(order.gross_amount || 0);
+    const isFullyReturned = allItemsFullyReturned || cumulativeRefund >= originalGross - 0.005;
+    const targetEarnedReversal = isFullyReturned
+      ? Number(order.loyalty_points_earned || 0)
+      : Math.floor(Number(order.loyalty_points_earned || 0) * cumulativeRefund / originalGross);
+    const targetRedeemedRestore = isFullyReturned
+      ? Number(order.loyalty_points_redeemed || 0)
+      : Math.floor(Number(order.loyalty_points_redeemed || 0) * cumulativeRefund / originalGross);
+    const earnedReversal = Math.max(0, targetEarnedReversal - Number(previousReturns.points_earned_reversed || 0));
+    const redeemedRestoration = Math.max(0, targetRedeemedRestore - Number(previousReturns.points_redeemed_restored || 0));
+    let couponUsageRestored = false;
+    if (order.loyalty_account_id && (earnedReversal || redeemedRestoration)) {
+      await client.query(
+        `UPDATE loyalty_accounts
+         SET points_balance = points_balance + $1 - $2, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
+        [redeemedRestoration, earnedReversal, order.loyalty_account_id]
+      );
+      if (earnedReversal) {
+        await client.query(
+          `INSERT INTO loyalty_transactions (loyalty_account_id, order_id, transaction_type, points_delta, amount, note)
+           VALUES ($1, $2, 'CANCEL_EARN_REVERSAL', $3, $4, $5)`,
+          [order.loyalty_account_id, orderId, -earnedReversal, refundAmount, `Points reversed for return ${returnNo}`]
+        );
+      }
+      if (redeemedRestoration) {
+        await client.query(
+          `INSERT INTO loyalty_transactions (loyalty_account_id, order_id, transaction_type, points_delta, amount, note)
+           VALUES ($1, $2, 'CANCEL_REDEEM_REVERSAL', $3, $4, $5)`,
+          [order.loyalty_account_id, orderId, redeemedRestoration, refundAmount, `Points restored for return ${returnNo}`]
+        );
+      }
+    }
+    if (isFullyReturned && order.coupon_id) {
+      await client.query('UPDATE coupons SET used_count = GREATEST(used_count - 1, 0) WHERE id = $1', [order.coupon_id]);
+      couponUsageRestored = true;
+    }
+    await client.query(
+      `UPDATE order_returns
+       SET points_earned_reversed = $1, points_redeemed_restored = $2, coupon_usage_restored = $3
+       WHERE id = $4`,
+      [earnedReversal, redeemedRestoration, couponUsageRestored, returnRecord.id]
+    );
+    if (isFullyReturned) {
+      await client.query("UPDATE orders SET status = 'RETURNED' WHERE id = $1", [orderId]);
+    }
+    await client.query('COMMIT');
+    req.auditSummary = {
+      return_no: returnNo,
+      order_no: order.order_no,
+      refund_amount: refundAmount,
+      refund_method: order.payment_method,
+      item_count: returnedDetails.length,
+      fully_returned: isFullyReturned,
+    };
+    const io = req.app.get('socketio');
+    if (io) io.to('operations').emit('order_returned', { orderId, returnNo, refundAmount, fullyReturned: isFullyReturned });
+    res.status(201).json({
+      success: true,
+      data: {
+        return: { ...returnRecord, refund_amount: refundAmount, restored_cogs: roundMoney(restoredCogs), points_earned_reversed: earnedReversal, points_redeemed_restored: redeemedRestoration, coupon_usage_restored: couponUsageRestored },
+        order: { id: orderId, status: isFullyReturned ? 'RETURNED' : order.status, refunded_amount: cumulativeRefund },
+        items: returnedDetails,
+      },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 400).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/orders - รับออเดอร์ใหม่
 router.post('/orders', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
   const { order_no, channel_id, items } = req.body;
@@ -153,6 +402,13 @@ router.put('/:id/cancel', requireRoles('ADMIN', 'STAFF'), async (req, res) => {
 
     if (orderRes.rows[0].status === 'CANCELLED') {
       throw new Error('Order is already cancelled');
+    }
+    const returnCheck = await client.query(
+      'SELECT id FROM order_returns WHERE order_id = $1 LIMIT 1',
+      [id]
+    );
+    if (returnCheck.rows.length) {
+      throw Object.assign(new Error('คำสั่งซื้อนี้มีรายการคืนแล้ว จึงไม่สามารถยกเลิกซ้ำได้'), { statusCode: 409 });
     }
 
     const previousIngredients = await client.query(

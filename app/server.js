@@ -501,6 +501,39 @@ const startServer = async () => {
     await client.query('CREATE INDEX IF NOT EXISTS order_payments_cash_shift_idx ON order_payments(cash_shift_id, status)');
     await client.query('CREATE INDEX IF NOT EXISTS orders_customer_phone_created_at_idx ON orders(customer_phone, created_at DESC)');
     await client.query(`
+      CREATE TABLE IF NOT EXISTS order_returns (
+        id BIGSERIAL PRIMARY KEY,
+        return_no VARCHAR(64) NOT NULL UNIQUE,
+        order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+        cash_shift_id BIGINT REFERENCES cash_shifts(id) ON DELETE SET NULL,
+        returned_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        refund_method VARCHAR(16) NOT NULL CHECK (refund_method IN ('CASH', 'QR', 'TRANSFER', 'CARD', 'OTHER')),
+        refund_amount NUMERIC(12, 2) NOT NULL CHECK (refund_amount > 0),
+        points_earned_reversed INTEGER NOT NULL DEFAULT 0 CHECK (points_earned_reversed >= 0),
+        points_redeemed_restored INTEGER NOT NULL DEFAULT 0 CHECK (points_redeemed_restored >= 0),
+        coupon_usage_restored BOOLEAN NOT NULL DEFAULT FALSE,
+        reason VARCHAR(500) NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_return_items (
+        id BIGSERIAL PRIMARY KEY,
+        return_id BIGINT NOT NULL REFERENCES order_returns(id) ON DELETE CASCADE,
+        order_item_id BIGINT NOT NULL REFERENCES order_items(id) ON DELETE RESTRICT,
+        product_id BIGINT REFERENCES products(id) ON DELETE SET NULL,
+        product_name VARCHAR(200) NOT NULL DEFAULT '',
+        quantity NUMERIC(12, 3) NOT NULL CHECK (quantity > 0),
+        unit_price NUMERIC(12, 2) NOT NULL CHECK (unit_price >= 0),
+        refund_amount NUMERIC(12, 2) NOT NULL CHECK (refund_amount >= 0)
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS order_returns_order_created_idx ON order_returns(order_id, created_at DESC)');
+    await client.query('CREATE INDEX IF NOT EXISTS order_return_items_order_item_idx ON order_return_items(order_item_id)');
+    await client.query('ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS points_earned_reversed INTEGER NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS points_redeemed_restored INTEGER NOT NULL DEFAULT 0');
+    await client.query('ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS coupon_usage_restored BOOLEAN NOT NULL DEFAULT FALSE');
+    await client.query(`
       CREATE TABLE IF NOT EXISTS suppliers (
         id BIGSERIAL PRIMARY KEY,
         name VARCHAR(160) NOT NULL UNIQUE,
@@ -610,6 +643,18 @@ const startServer = async () => {
     await client.query('CREATE UNIQUE INDEX IF NOT EXISTS inventory_lots_receipt_item_unique_idx ON inventory_lots(stock_receipt_item_id) WHERE stock_receipt_item_id IS NOT NULL');
     await client.query('CREATE INDEX IF NOT EXISTS inventory_lots_fefo_idx ON inventory_lots(ingredient_id, expiry_date, received_at) WHERE remaining_quantity > 0');
     await client.query('CREATE INDEX IF NOT EXISTS order_item_lot_allocations_order_item_idx ON order_item_lot_allocations(order_item_id)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_return_lot_restorations (
+        id BIGSERIAL PRIMARY KEY,
+        return_item_id BIGINT NOT NULL REFERENCES order_return_items(id) ON DELETE CASCADE,
+        order_item_lot_allocation_id BIGINT NOT NULL REFERENCES order_item_lot_allocations(id) ON DELETE RESTRICT,
+        inventory_lot_id BIGINT NOT NULL REFERENCES inventory_lots(id) ON DELETE RESTRICT,
+        quantity NUMERIC(12, 3) NOT NULL CHECK (quantity > 0),
+        unit_cost NUMERIC(12, 4) NOT NULL CHECK (unit_cost >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS order_return_lot_restoration_allocation_idx ON order_return_lot_restorations(order_item_lot_allocation_id)');
     await client.query(`
       INSERT INTO inventory_lots
         (ingredient_id, lot_no, received_at, expiry_date, initial_quantity, remaining_quantity, unit_cost)
@@ -870,6 +915,9 @@ app.get('/api/admin/backups/export', requireAuth, requireRoles('ADMIN'), async (
     order_items: `SELECT * FROM order_items ORDER BY id`,
     order_item_modifiers: `SELECT * FROM order_item_modifiers ORDER BY id`,
     order_item_lot_allocations: `SELECT * FROM order_item_lot_allocations ORDER BY id`,
+    order_returns: `SELECT * FROM order_returns ORDER BY id`,
+    order_return_items: `SELECT * FROM order_return_items ORDER BY id`,
+    order_return_lot_restorations: `SELECT * FROM order_return_lot_restorations ORDER BY id`,
     order_payments: `SELECT * FROM order_payments ORDER BY id`,
     coupons: `SELECT * FROM coupons ORDER BY id`,
     expenses: `SELECT * FROM expenses ORDER BY id`,
@@ -1555,11 +1603,13 @@ app.put('/api/channels/:id', requireAuth, requireRoles('ADMIN'), requirePermissi
 });
 
 const shiftWithCashSales = `
-  SELECT cs.*, COALESCE(SUM(op.paid_amount) FILTER (
-    WHERE op.payment_method = 'CASH' AND op.status = 'PAID'
-  ), 0) AS cash_sales
+  SELECT cs.*, (
+    COALESCE((SELECT SUM(op.paid_amount) FROM order_payments op
+      WHERE op.cash_shift_id = cs.id AND op.payment_method = 'CASH' AND op.status = 'PAID'), 0)
+    - COALESCE((SELECT SUM(orr.refund_amount) FROM order_returns orr
+      WHERE orr.cash_shift_id = cs.id AND orr.refund_method = 'CASH'), 0)
+  ) AS cash_sales
   FROM cash_shifts cs
-  LEFT JOIN order_payments op ON op.cash_shift_id = cs.id
 `;
 
 app.get('/api/shifts/current', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('cash-shifts', 'view'), async (req, res) => {
@@ -1567,7 +1617,6 @@ app.get('/api/shifts/current', requireAuth, requireRoles('ADMIN', 'STAFF'), requ
     const result = await pool.query(
       `${shiftWithCashSales}
        WHERE cs.opened_by = $1 AND cs.status = 'OPEN'
-       GROUP BY cs.id
        ORDER BY cs.opened_at DESC
        LIMIT 1`,
       [req.user.sub]
@@ -1582,15 +1631,14 @@ app.get('/api/shifts', requireAuth, requireRoles('ADMIN'), requirePermission('ca
   try {
     const result = await pool.query(
       `SELECT cs.*, opened_user.full_name AS opened_by_name,
-        closed_user.full_name AS closed_by_name, COALESCE(SUM(op.paid_amount) FILTER (
-        WHERE op.payment_method = 'CASH' AND op.status = 'PAID'
-      ), 0) AS cash_sales
+        closed_user.full_name AS closed_by_name, (
+          COALESCE((SELECT SUM(op.paid_amount) FROM order_payments op WHERE op.cash_shift_id = cs.id AND op.payment_method = 'CASH' AND op.status = 'PAID'), 0)
+          - COALESCE((SELECT SUM(orr.refund_amount) FROM order_returns orr WHERE orr.cash_shift_id = cs.id AND orr.refund_method = 'CASH'), 0)
+        ) AS cash_sales
        FROM cash_shifts cs
-       LEFT JOIN order_payments op ON op.cash_shift_id = cs.id
        LEFT JOIN users opened_user ON opened_user.id = cs.opened_by
        LEFT JOIN users closed_user ON closed_user.id = cs.closed_by
        WHERE cs.status IN ('OPEN', 'CLOSED')
-       GROUP BY cs.id, opened_user.full_name, closed_user.full_name
        ORDER BY cs.opened_at DESC
        LIMIT 50`
     );
@@ -1636,9 +1684,10 @@ app.post('/api/shifts/:id/close', requireAuth, requireRoles('ADMIN', 'STAFF'), r
       throw requestError('Only the shift owner or an admin can close this shift', 403);
     }
     const cashResult = await client.query(
-      `SELECT COALESCE(SUM(paid_amount), 0) AS cash_sales
-       FROM order_payments
-       WHERE cash_shift_id = $1 AND payment_method = 'CASH' AND status = 'PAID'`,
+      `SELECT (
+        COALESCE((SELECT SUM(paid_amount) FROM order_payments WHERE cash_shift_id = $1 AND payment_method = 'CASH' AND status = 'PAID'), 0)
+        - COALESCE((SELECT SUM(refund_amount) FROM order_returns WHERE cash_shift_id = $1 AND refund_method = 'CASH'), 0)
+      ) AS cash_sales`,
       [shift.id]
     );
     const cashSales = Number(cashResult.rows[0].cash_sales || 0);
@@ -1675,6 +1724,16 @@ app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (
               o.subtotal_amount, o.discount_amount, o.manual_discount_amount, o.coupon_discount_amount, o.loyalty_discount_amount,
               o.loyalty_points_earned, o.loyalty_points_redeemed,
               o.coupon_code, o.coupon_id, o.gross_amount, o.gp_amount, o.total_cogs, o.net_revenue, o.net_profit, o.created_at,
+              COALESCE((SELECT SUM(orr.refund_amount) FROM order_returns orr WHERE orr.order_id = o.id), 0) AS refunded_amount,
+              COALESCE((SELECT SUM(orlr.quantity * orlr.unit_cost)
+                FROM order_returns orr
+                JOIN order_return_items ori ON ori.return_id = orr.id
+                JOIN order_return_lot_restorations orlr ON orlr.return_item_id = ori.id
+                WHERE orr.order_id = o.id), 0) AS restored_cogs,
+              COALESCE((SELECT JSON_AGG(JSON_BUILD_OBJECT(
+                'return_no', orr.return_no, 'refund_amount', orr.refund_amount, 'refund_method', orr.refund_method,
+                'reason', orr.reason, 'created_at', orr.created_at
+              ) ORDER BY orr.created_at DESC) FROM order_returns orr WHERE orr.order_id = o.id), '[]'::json) AS returns,
               COALESCE((
                 SELECT JSON_BUILD_OBJECT(
                   'payment_method', op.payment_method,
@@ -1690,9 +1749,11 @@ app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (
               ), 'null'::json) AS payment,
               COALESCE(
                 JSON_AGG(JSON_BUILD_OBJECT(
+                  'order_item_id', oi.id,
                   'product_id', oi.product_id,
                   'name', p.name,
                   'quantity', oi.quantity,
+                  'returned_quantity', COALESCE((SELECT SUM(ori.quantity) FROM order_return_items ori WHERE ori.order_item_id = oi.id), 0),
                   'unit_price', oi.unit_price,
                   'subtotal', oi.subtotal,
                   'modifiers', COALESCE((
@@ -1749,17 +1810,32 @@ app.get('/api/financial-summary', requireAuth, requireRoles('ADMIN'), requirePer
   try {
     const query = `
       SELECT 
-        COALESCE(SUM(gross_amount), 0) AS total_gross,
-        COALESCE(SUM(gp_amount), 0) AS total_gp,
-        COALESCE(SUM(net_revenue), 0) AS total_net_revenue,
-        COALESCE(SUM(total_cogs), 0) AS total_cogs,
-        COALESCE(SUM(net_profit), 0) AS total_net_profit,
-        COUNT(id) AS total_orders,
+        COALESCE(SUM(o.gross_amount - COALESCE(return_totals.refund_amount, 0)), 0) AS total_gross,
+        COALESCE(SUM(o.gp_amount - (o.gp_amount * COALESCE(return_totals.refund_amount, 0) / NULLIF(o.gross_amount, 0))), 0) AS total_gp,
+        COALESCE(SUM(o.net_revenue - (o.net_revenue * COALESCE(return_totals.refund_amount, 0) / NULLIF(o.gross_amount, 0))), 0) AS total_net_revenue,
+        COALESCE(SUM(o.total_cogs - COALESCE(return_totals.restored_cogs, 0)), 0) AS total_cogs,
+        COALESCE(SUM((o.net_revenue - (o.net_revenue * COALESCE(return_totals.refund_amount, 0) / NULLIF(o.gross_amount, 0))) - (o.total_cogs - COALESCE(return_totals.restored_cogs, 0))), 0) AS total_net_profit,
+        COUNT(o.id) AS total_orders,
         (SELECT COALESCE(SUM(amount), 0) FROM expenses
          WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)) AS total_expenses
-      FROM orders
-      WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)
-        AND status <> 'CANCELLED';
+      FROM orders o
+      LEFT JOIN (
+        SELECT returned_amounts.order_id, returned_amounts.refund_amount,
+               COALESCE(restored_costs.restored_cogs, 0) AS restored_cogs
+        FROM (
+          SELECT order_id, SUM(refund_amount) AS refund_amount
+          FROM order_returns GROUP BY order_id
+        ) returned_amounts
+        LEFT JOIN (
+          SELECT orr.order_id, SUM(orlr.quantity * orlr.unit_cost) AS restored_cogs
+          FROM order_returns orr
+          JOIN order_return_items ori ON ori.return_id = orr.id
+          JOIN order_return_lot_restorations orlr ON orlr.return_item_id = ori.id
+          GROUP BY orr.order_id
+        ) restored_costs ON restored_costs.order_id = returned_amounts.order_id
+      ) return_totals ON return_totals.order_id = o.id
+      WHERE DATE(o.created_at AT TIME ZONE 'Asia/Bangkok') = COALESCE($1::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date)
+        AND o.status <> 'CANCELLED';
     `;
     const result = await pool.query(query, [recordDate]);
     res.json({ success: true, data: result.rows[0] });
@@ -1777,10 +1853,11 @@ app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), requirePermi
       pool.query(
         `SELECT COALESCE(c.name, 'ไม่ระบุช่องทาง') AS channel_name,
                 COUNT(o.id)::int AS order_count,
-                COALESCE(SUM(o.gross_amount), 0) AS gross_amount,
-                COALESCE(SUM(o.net_revenue), 0) AS net_revenue
+                COALESCE(SUM(o.gross_amount - COALESCE(rt.refund_amount, 0)), 0) AS gross_amount,
+                COALESCE(SUM(o.net_revenue - (o.net_revenue * COALESCE(rt.refund_amount, 0) / NULLIF(o.gross_amount, 0))), 0) AS net_revenue
          FROM orders o
          LEFT JOIN channels c ON c.id = o.channel_id
+         LEFT JOIN (SELECT order_id, SUM(refund_amount) AS refund_amount FROM order_returns GROUP BY order_id) rt ON rt.order_id = o.id
          WHERE ${dateFilter} AND o.status <> 'CANCELLED'
          GROUP BY c.id, c.name
          ORDER BY gross_amount DESC, channel_name ASC`,
@@ -1789,10 +1866,11 @@ app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), requirePermi
       pool.query(
         `SELECT COALESCE(op.payment_method, 'OTHER') AS payment_method,
                 COUNT(o.id)::int AS order_count,
-                COALESCE(SUM(COALESCE(op.paid_amount, o.gross_amount)), 0) AS payment_amount,
+                COALESCE(SUM(COALESCE(op.paid_amount, o.gross_amount) - COALESCE(rt.refund_amount, 0)), 0) AS payment_amount,
                 COALESCE(SUM(COALESCE(op.change_amount, 0)), 0) AS change_amount
          FROM orders o
          LEFT JOIN order_payments op ON op.order_id = o.id AND op.status = 'PAID'
+         LEFT JOIN (SELECT order_id, SUM(refund_amount) AS refund_amount FROM order_returns GROUP BY order_id) rt ON rt.order_id = o.id
          WHERE ${dateFilter} AND o.status <> 'CANCELLED'
          GROUP BY COALESCE(op.payment_method, 'OTHER')
          ORDER BY payment_amount DESC, payment_method ASC`,
@@ -2004,15 +2082,26 @@ app.post('/api/daily-closings', requireAuth, requireRoles('ADMIN'), requirePermi
       throw requestError('กรุณาปิดกะเงินสดที่เปิดอยู่ก่อนปิดยอดประจำวัน', 409);
     }
     const orderSummary = await client.query(
-      `SELECT COUNT(id)::int AS order_count,
-              COALESCE(SUM(gross_amount), 0) AS gross_amount,
-              COALESCE(SUM(net_revenue), 0) AS net_revenue,
-              COALESCE(SUM(total_cogs), 0) AS total_cogs,
-              COALESCE(SUM(net_profit), 0) AS gross_profit,
-              COALESCE(SUM(manual_discount_amount), 0) + COALESCE(SUM(coupon_discount_amount), 0) + COALESCE(SUM(loyalty_discount_amount), 0) AS discount_amount
-       FROM orders
-       WHERE DATE(created_at AT TIME ZONE 'Asia/Bangkok') = $1::date
-         AND status <> 'CANCELLED'`,
+      `SELECT COUNT(o.id)::int AS order_count,
+              COALESCE(SUM(o.gross_amount - COALESCE(rt.refund_amount, 0)), 0) AS gross_amount,
+              COALESCE(SUM(o.net_revenue - (o.net_revenue * COALESCE(rt.refund_amount, 0) / NULLIF(o.gross_amount, 0))), 0) AS net_revenue,
+              COALESCE(SUM(o.total_cogs - COALESCE(rt.restored_cogs, 0)), 0) AS total_cogs,
+              COALESCE(SUM((o.net_revenue - (o.net_revenue * COALESCE(rt.refund_amount, 0) / NULLIF(o.gross_amount, 0))) - (o.total_cogs - COALESCE(rt.restored_cogs, 0))), 0) AS gross_profit,
+              COALESCE(SUM(o.manual_discount_amount), 0) + COALESCE(SUM(o.coupon_discount_amount), 0) + COALESCE(SUM(o.loyalty_discount_amount), 0) AS discount_amount
+       FROM orders o
+       LEFT JOIN (
+         SELECT refunds.order_id, refunds.refund_amount, COALESCE(costs.restored_cogs, 0) AS restored_cogs
+         FROM (SELECT order_id, SUM(refund_amount) AS refund_amount FROM order_returns GROUP BY order_id) refunds
+         LEFT JOIN (
+           SELECT orr.order_id, SUM(orlr.quantity * orlr.unit_cost) AS restored_cogs
+           FROM order_returns orr
+           JOIN order_return_items ori ON ori.return_id = orr.id
+           JOIN order_return_lot_restorations orlr ON orlr.return_item_id = ori.id
+           GROUP BY orr.order_id
+         ) costs ON costs.order_id = refunds.order_id
+       ) rt ON rt.order_id = o.id
+       WHERE DATE(o.created_at AT TIME ZONE 'Asia/Bangkok') = $1::date
+         AND o.status <> 'CANCELLED'`,
       [businessDate]
     );
     const expenseSummary = await client.query(
@@ -2688,6 +2777,8 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
     );
     if (!orderResult.rows.length) throw new Error('Order not found');
     await assertBusinessDateOpen(client, orderResult.rows[0].business_date);
+    const returnCheck = await client.query('SELECT id FROM order_returns WHERE order_id = $1 LIMIT 1', [id]);
+    if (returnCheck.rows.length) throw requestError('คำสั่งซื้อนี้มีประวัติคืนสินค้าแล้ว จึงไม่สามารถลบได้', 409);
     const deletedItems = await client.query(
       `SELECT oi.product_id, p.name, oi.quantity, oi.unit_price,
               COALESCE((
