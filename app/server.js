@@ -166,7 +166,7 @@ const requireResourcePermission = (resource) => (req, res, next) => {
 };
 const getLoyaltyRules = async (client = pool, { forUpdate = false } = {}) => {
   const result = await client.query(
-    `SELECT is_enabled, earn_mode, spend_per_point, cups_per_point, baht_per_point, max_redeem_percent, updated_at
+    `SELECT is_enabled, earn_enabled, redeem_enabled, earn_mode, spend_per_point, cups_per_point, baht_per_point, max_redeem_percent, updated_at
      FROM loyalty_settings WHERE id = 1${forUpdate ? ' FOR UPDATE' : ''}`,
   );
   return loyaltyRules(result.rows[0]);
@@ -345,6 +345,8 @@ const startServer = async () => {
       CREATE TABLE IF NOT EXISTS loyalty_settings (
         id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
         is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        earn_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        redeem_enabled BOOLEAN NOT NULL DEFAULT TRUE,
         earn_mode VARCHAR(12) NOT NULL DEFAULT 'SPEND' CHECK (earn_mode IN ('SPEND', 'CUP')),
         spend_per_point NUMERIC(12, 2) NOT NULL DEFAULT 25 CHECK (spend_per_point > 0),
         cups_per_point NUMERIC(12, 2) NOT NULL DEFAULT 1 CHECK (cups_per_point > 0),
@@ -356,11 +358,16 @@ const startServer = async () => {
     `);
     await client.query("ALTER TABLE loyalty_settings ADD COLUMN IF NOT EXISTS earn_mode VARCHAR(12) NOT NULL DEFAULT 'SPEND'");
     await client.query('ALTER TABLE loyalty_settings ADD COLUMN IF NOT EXISTS cups_per_point NUMERIC(12, 2) NOT NULL DEFAULT 1');
+    await client.query('ALTER TABLE loyalty_settings ADD COLUMN IF NOT EXISTS earn_enabled BOOLEAN NOT NULL DEFAULT TRUE');
+    await client.query('ALTER TABLE loyalty_settings ADD COLUMN IF NOT EXISTS redeem_enabled BOOLEAN NOT NULL DEFAULT TRUE');
     await client.query(`
       INSERT INTO loyalty_settings (id)
       VALUES (1)
       ON CONFLICT (id) DO NOTHING
     `);
+    await client.query(`UPDATE loyalty_settings
+      SET earn_enabled = FALSE, redeem_enabled = FALSE
+      WHERE is_enabled = FALSE AND earn_enabled = TRUE AND redeem_enabled = TRUE`);
     await client.query(`
       CREATE TABLE IF NOT EXISTS loyalty_accounts (
         id BIGSERIAL PRIMARY KEY,
@@ -1163,12 +1170,14 @@ app.put('/api/loyalty/settings', requireAuth, requireRoles('ADMIN'), requirePerm
     const settings = validateLoyaltySettings(req.body);
     const result = await pool.query(
       `UPDATE loyalty_settings
-       SET is_enabled = $1, earn_mode = $2, spend_per_point = $3, cups_per_point = $4,
-           baht_per_point = $5, max_redeem_percent = $6, updated_by = $7, updated_at = CURRENT_TIMESTAMP
+       SET is_enabled = $1, earn_enabled = $2, redeem_enabled = $3, earn_mode = $4, spend_per_point = $5, cups_per_point = $6,
+           baht_per_point = $7, max_redeem_percent = $8, updated_by = $9, updated_at = CURRENT_TIMESTAMP
        WHERE id = 1
-       RETURNING is_enabled, earn_mode, spend_per_point, cups_per_point, baht_per_point, max_redeem_percent, updated_at`,
+       RETURNING is_enabled, earn_enabled, redeem_enabled, earn_mode, spend_per_point, cups_per_point, baht_per_point, max_redeem_percent, updated_at`,
       [
         settings.is_enabled,
+        settings.earn_enabled,
+        settings.redeem_enabled,
         settings.earn_mode,
         settings.spend_per_point,
         settings.cups_per_point,
@@ -2434,10 +2443,10 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     let loyaltyAccount = null;
     let loyaltyPointsRedeemed = 0;
     let loyaltyDiscountAmount = 0;
-    if (!currentLoyaltyRules.is_enabled && requestedLoyaltyPoints > 0) {
+    if (!currentLoyaltyRules.redeem_enabled && requestedLoyaltyPoints > 0) {
       throw requestError('Loyalty redemption is currently disabled', 409);
     }
-    if (currentLoyaltyRules.is_enabled && customerPhone) {
+    if ((currentLoyaltyRules.earn_enabled || currentLoyaltyRules.redeem_enabled) && customerPhone) {
       const accountResult = await client.query(
         `SELECT id, customer_phone, customer_name, points_balance, lifetime_points, lifetime_spend, updated_at
          FROM loyalty_accounts WHERE customer_phone = $1 FOR UPDATE`,
@@ -2471,7 +2480,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
 
     const discountAmount = manualDiscountAmount + couponDiscountAmount + loyaltyDiscountAmount;
     const grossAmount = Math.max(0, subtotalAmount - discountAmount);
-    const loyaltyPointsEarned = loyaltyAccount
+    const loyaltyPointsEarned = loyaltyAccount && currentLoyaltyRules.earn_enabled
       ? loyaltyPointsForOrder({ amount: grossAmount, cups: totalCups }, currentLoyaltyRules)
       : 0;
 

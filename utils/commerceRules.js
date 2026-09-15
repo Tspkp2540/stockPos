@@ -3,6 +3,8 @@ const requestError = (message, statusCode = 400) =>
 
 const DEFAULT_LOYALTY_RULES = Object.freeze({
   is_enabled: true,
+  earn_enabled: true,
+  redeem_enabled: true,
   earn_mode: 'SPEND',
   spend_per_point: 25,
   cups_per_point: 1,
@@ -15,6 +17,8 @@ const normalizeCouponCode = (value) =>
 
 const loyaltyRules = (settings = DEFAULT_LOYALTY_RULES) => ({
   is_enabled: settings.is_enabled !== false,
+  earn_enabled: settings.earn_enabled !== undefined ? settings.earn_enabled === true : settings.is_enabled !== false,
+  redeem_enabled: settings.redeem_enabled !== undefined ? settings.redeem_enabled === true : settings.is_enabled !== false,
   earn_mode: String(settings.earn_mode || DEFAULT_LOYALTY_RULES.earn_mode).toUpperCase() === 'CUP' ? 'CUP' : 'SPEND',
   spend_per_point: Number(settings.spend_per_point || DEFAULT_LOYALTY_RULES.spend_per_point),
   cups_per_point: Number(settings.cups_per_point || DEFAULT_LOYALTY_RULES.cups_per_point),
@@ -35,13 +39,15 @@ const loyaltyDiscountForPoints = (points, rules) => Number((
 ).toFixed(2));
 
 const validateLoyaltySettings = (value = {}) => {
-  const isEnabled = value.is_enabled;
+  const legacyIsEnabled = value.is_enabled;
+  const earnEnabled = value.earn_enabled === undefined ? legacyIsEnabled : value.earn_enabled;
+  const redeemEnabled = value.redeem_enabled === undefined ? legacyIsEnabled : value.redeem_enabled;
   const earnMode = String(value.earn_mode || 'SPEND').trim().toUpperCase();
   const spendPerPoint = Number(value.spend_per_point);
   const cupsPerPoint = Number(value.cups_per_point);
   const bahtPerPoint = Number(value.baht_per_point);
   const maxRedeemPercent = Number(value.max_redeem_percent);
-  if (typeof isEnabled !== 'boolean') throw requestError('Loyalty enabled setting must be true or false');
+  if (typeof earnEnabled !== 'boolean' || typeof redeemEnabled !== 'boolean') throw requestError('Loyalty earn and redeem settings must be true or false');
   if (!['SPEND', 'CUP'].includes(earnMode)) throw requestError('Loyalty earn mode must be SPEND or CUP');
   if (!Number.isFinite(spendPerPoint) || spendPerPoint < 0.01 || spendPerPoint > 1000000) {
     throw requestError('Spend per point must be between 0.01 and 1,000,000');
@@ -56,7 +62,9 @@ const validateLoyaltySettings = (value = {}) => {
     throw requestError('Maximum redemption percentage must be between 0 and 100');
   }
   return {
-    is_enabled: isEnabled,
+    is_enabled: earnEnabled || redeemEnabled,
+    earn_enabled: earnEnabled,
+    redeem_enabled: redeemEnabled,
     earn_mode: earnMode,
     spend_per_point: Number(spendPerPoint.toFixed(2)),
     cups_per_point: Number(cupsPerPoint.toFixed(2)),

@@ -44,6 +44,8 @@ test('loyalty rules earn points by spend or configured cups', () => {
 test('loyalty settings normalize valid values and reject invalid limits', () => {
   assert.deepEqual(validateLoyaltySettings({
     is_enabled: true,
+    earn_enabled: true,
+    redeem_enabled: true,
     earn_mode: 'cup',
     spend_per_point: '25.678',
     cups_per_point: '2',
@@ -51,12 +53,24 @@ test('loyalty settings normalize valid values and reject invalid limits', () => 
     max_redeem_percent: '50',
   }), {
     is_enabled: true,
+    earn_enabled: true,
+    redeem_enabled: true,
     earn_mode: 'CUP',
     spend_per_point: 25.68,
     cups_per_point: 2,
     baht_per_point: 0.1,
     max_redeem_percent: 50,
   });
+  assert.equal(validateLoyaltySettings({
+    earn_enabled: true,
+    redeem_enabled: false,
+    earn_mode: 'SPEND',
+    spend_per_point: 25,
+    cups_per_point: 1,
+    baht_per_point: 0.1,
+    max_redeem_percent: 50,
+  }).redeem_enabled, false);
+  assert.throws(() => validateLoyaltySettings({ earn_enabled: true, redeem_enabled: 'false', earn_mode: 'SPEND', spend_per_point: 25, cups_per_point: 1, baht_per_point: 0.1, max_redeem_percent: 50 }), /true or false/);
   assert.throws(() => validateLoyaltySettings({ is_enabled: 'true', earn_mode: 'SPEND', spend_per_point: 25, cups_per_point: 1, baht_per_point: 0.1, max_redeem_percent: 50 }), /true or false/);
   assert.throws(() => validateLoyaltySettings({ is_enabled: true, earn_mode: 'GIFT', spend_per_point: 25, cups_per_point: 1, baht_per_point: 0.1, max_redeem_percent: 50 }), /earn mode/);
   assert.throws(() => validateLoyaltySettings({ is_enabled: true, earn_mode: 'SPEND', spend_per_point: 25, cups_per_point: 0, baht_per_point: 0.1, max_redeem_percent: 50 }), /Cups per point/);
