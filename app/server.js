@@ -3393,7 +3393,12 @@ app.put('/api/orders/:id/kitchen-stations/:station', requireAuth, requireRoles('
     const orderStatus = Number(outstanding.rows[0]?.count || 0) === 0 ? 'READY' : 'COOKING';
     await client.query(`UPDATE orders SET status = $1 WHERE id = $2`, [orderStatus, orderId]);
     await client.query('COMMIT');
-    io.to('operations').emit('order_status_updated', { orderId, status: orderStatus });
+    io.to('operations').emit('order_status_updated', {
+      orderId,
+      status: orderStatus,
+      productionStation: station,
+      productionStatus,
+    });
     res.json({ success: true, data: { order_id: orderId, production_station: station, production_status: productionStatus, order_status: orderStatus, ...items.rows[0] } });
   } catch (error) {
     try {
