@@ -3396,8 +3396,22 @@ app.put('/api/orders/:id/kitchen-stations/:station', requireAuth, requireRoles('
     io.to('operations').emit('order_status_updated', { orderId, status: orderStatus });
     res.json({ success: true, data: { order_id: orderId, production_station: station, production_status: productionStatus, order_status: orderStatus, ...items.rows[0] } });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Kitchen transaction rollback failed:', rollbackError);
+    }
+    const errorCode = error.code || 'KITCHEN_UPDATE_FAILED';
+    console.error('Kitchen station update failed:', {
+      orderId,
+      station,
+      productionStatus,
+      code: errorCode,
+      constraint: error.constraint,
+      detail: error.detail,
+      message: error.message,
+    });
+    res.status(error.statusCode || 500).json({ success: false, code: errorCode, error: error.message || 'ไม่สามารถอัปเดตสถานะห้องครัวได้' });
   } finally { client.release(); }
 });
 
