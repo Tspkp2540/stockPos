@@ -3019,7 +3019,28 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     // ยืนยันการทำ Transaction ลง Database
     await client.query('COMMIT');
 
-    const createdOrder = { ...updatedOrderRes.rows[0], payments };
+    // ส่งรายละเอียดรายการและจุดผลิตกลับไปพร้อมออเดอร์ใหม่ทันที เพื่อให้จอครัว
+    // แยกงานบาร์/ครัว/ขนมได้โดยไม่ต้องรอรอบดึงข้อมูลถัดไป
+    const createdItemsResult = await client.query(
+      `SELECT oi.id AS order_item_id, oi.product_id, p.name, oi.quantity, oi.unit_price,
+              oi.production_station, oi.target_prep_minutes, oi.production_status,
+              COALESCE(
+                json_agg(
+                  json_build_object('id', oim.modifier_option_id, 'name', oim.option_name,
+                                    'group_name', oim.group_name, 'price_adjustment', oim.price_adjustment)
+                  ORDER BY oim.id
+                ) FILTER (WHERE oim.id IS NOT NULL),
+                '[]'::json
+              ) AS modifiers
+       FROM order_items oi
+       JOIN products p ON p.id = oi.product_id
+       LEFT JOIN order_item_modifiers oim ON oim.order_item_id = oi.id
+       WHERE oi.order_id = $1
+       GROUP BY oi.id, p.name
+       ORDER BY oi.id`,
+      [orderId]
+    );
+    const createdOrder = { ...updatedOrderRes.rows[0], payments, items: createdItemsResult.rows };
 
     // 6. ส่ง Real-time Event ให้ทุก Client (หน้าเว็บ 3D / หน้า POS / หน้า Kitchen)
     io.to('operations').emit('new_order_created', {
@@ -3362,6 +3383,20 @@ app.put('/api/orders/:id/status', requireAuth, requireRoles('ADMIN', 'STAFF'), r
       return res.status(404).json({ success: false, error: 'Order not found' });
     }
     await assertBusinessDateOpen(pool, current.rows[0].business_date);
+    if (status === 'READY' || status === 'COMPLETED') {
+      const readiness = await pool.query(
+        `SELECT o.status, COUNT(oi.id) FILTER (WHERE oi.production_status <> 'READY')::int AS pending_station_items
+         FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id
+         WHERE o.id = $1 GROUP BY o.id`,
+        [id]
+      );
+      const order = readiness.rows[0];
+      const isReadyForDelivery = order?.status === 'READY' && Number(order.pending_station_items || 0) === 0;
+      const isReadyForPickup = Number(order?.pending_station_items || 0) === 0;
+      if ((status === 'READY' && !isReadyForPickup) || (status === 'COMPLETED' && !isReadyForDelivery)) {
+        return res.status(409).json({ success: false, error: status === 'READY' ? 'ครัวยังยืนยันการผลิตไม่ครบ จึงยังตั้งเป็นพร้อมรับสินค้าไม่ได้' : 'ครัวยังยืนยันการผลิตไม่ครบ จึงยังส่งมอบออเดอร์ไม่ได้' });
+      }
+    }
     const result = await pool.query(
       `UPDATE orders SET status = $1 WHERE id = $2 RETURNING *`,
       [status, id]
