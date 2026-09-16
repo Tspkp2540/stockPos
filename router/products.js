@@ -35,6 +35,18 @@ const normalizeImageData = (value) => {
   return imageData;
 };
 
+const normalizeProduction = (station, prepMinutes) => {
+  const productionStation = String(station || 'BAR').trim().toUpperCase();
+  const targetPrepMinutes = Number(prepMinutes ?? 5);
+  if (!['BAR', 'KITCHEN', 'BAKERY', 'OTHER'].includes(productionStation)) {
+    throw new Error('Production station is invalid');
+  }
+  if (!Number.isInteger(targetPrepMinutes) || targetPrepMinutes < 1 || targetPrepMinutes > 180) {
+    throw new Error('Preparation time must be between 1 and 180 minutes');
+  }
+  return { productionStation, targetPrepMinutes };
+};
+
 const normalizeChannelSettings = (settings) => {
   if (settings === undefined) return null;
   if (!Array.isArray(settings)) throw new Error('Channel settings must be a list');
@@ -266,7 +278,7 @@ router.patch('/:id/availability', async (req, res) => {
 
 // 📌 POST /api/products - เพิ่มสินค้าใหม่
 router.post('/', async (req, res) => {
-  const { name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup, recipe = [], modifiers = [], channel_settings } = req.body;
+  const { name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup, production_station, prep_minutes, recipe = [], modifiers = [], channel_settings } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
@@ -274,11 +286,13 @@ router.post('/', async (req, res) => {
   let normalizedChannelSettings;
   let normalizedImageUrl;
   let normalizedImageData;
+  let production;
   try {
     normalizedModifiers = normalizeModifiers(modifiers);
     normalizedChannelSettings = normalizeChannelSettings(channel_settings);
     normalizedImageUrl = normalizeImageUrl(image_url);
     normalizedImageData = normalizeImageData(image_data);
+    production = normalizeProduction(production_station, prep_minutes);
   } catch (error) {
     return res.status(400).json({ success: false, error: error.message });
   }
@@ -286,9 +300,9 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN');
     const result = await client.query(
-      `INSERT INTO products (name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [name, category, normalizeBarcode(barcode), normalizedImageUrl, normalizedImageData, price_retail, price_wholesale || null, counts_as_loyalty_cup === true]
+      `INSERT INTO products (name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup, production_station, prep_minutes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [name, category, normalizeBarcode(barcode), normalizedImageUrl, normalizedImageData, price_retail, price_wholesale || null, counts_as_loyalty_cup === true, production.productionStation, production.targetPrepMinutes]
     );
     for (const ingredient of recipe) {
       await client.query(
@@ -311,7 +325,7 @@ router.post('/', async (req, res) => {
 
 // PUT /api/products/:id - แก้ไขเมนูและสูตรวัตถุดิบ
 router.put('/:id', async (req, res) => {
-  const { name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup, recipe = [], modifiers = [], channel_settings } = req.body;
+  const { name, category, barcode, image_url, image_data, price_retail, price_wholesale, counts_as_loyalty_cup, production_station, prep_minutes, recipe = [], modifiers = [], channel_settings } = req.body;
   if (!name || !Number.isFinite(Number(price_retail)) || !Array.isArray(recipe) || recipe.length === 0 || recipe.some((item) => !item.ingredient_id || !Number.isFinite(Number(item.quantity_used)) || Number(item.quantity_used) <= 0)) {
     return res.status(400).json({ success: false, error: 'Menu must include at least one valid ingredient recipe' });
   }
@@ -319,11 +333,13 @@ router.put('/:id', async (req, res) => {
   let normalizedChannelSettings;
   let normalizedImageUrl;
   let normalizedImageData;
+  let production;
   try {
     normalizedModifiers = normalizeModifiers(modifiers);
     normalizedChannelSettings = normalizeChannelSettings(channel_settings);
     normalizedImageUrl = normalizeImageUrl(image_url);
     normalizedImageData = normalizeImageData(image_data);
+    production = normalizeProduction(production_station, prep_minutes);
   } catch (error) {
     return res.status(400).json({ success: false, error: error.message });
   }
@@ -344,9 +360,9 @@ router.put('/:id', async (req, res) => {
       price_changed: Math.abs(Number(existing.rows[0].price_retail || 0) - Number(price_retail)) > 0.000001,
     };
     const result = await client.query(
-      `UPDATE products SET name = $1, category = $2, barcode = $3, image_url = $4, image_data = $5, price_retail = $6, price_wholesale = $7, counts_as_loyalty_cup = $8
-       WHERE id = $9 RETURNING *`,
-      [name, category, normalizeBarcode(barcode), normalizedImageUrl, normalizedImageData, price_retail, price_wholesale || null, counts_as_loyalty_cup === true, req.params.id]
+      `UPDATE products SET name = $1, category = $2, barcode = $3, image_url = $4, image_data = $5, price_retail = $6, price_wholesale = $7, counts_as_loyalty_cup = $8, production_station = $9, prep_minutes = $10
+       WHERE id = $11 RETURNING *`,
+      [name, category, normalizeBarcode(barcode), normalizedImageUrl, normalizedImageData, price_retail, price_wholesale || null, counts_as_loyalty_cup === true, production.productionStation, production.targetPrepMinutes, req.params.id]
     );
     if (!result.rows.length) {
       await client.query('ROLLBACK');

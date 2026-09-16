@@ -26,6 +26,33 @@ const {
 } = require('../utils/commerceRules');
 const { permissionActions, permissionMenus, ROLE_PERMISSION_DEFAULTS, sanitizePermissions } = require('../utils/rolePermissions');
 
+const promotionDiscountForAmount = (promotion, amount) => {
+  const base = Math.max(0, Number(amount) || 0);
+  if (!promotion || !promotion.is_active || base < Number(promotion.min_order_amount || 0)) return 0;
+  const raw = promotion.discount_type === 'PERCENT'
+    ? base * Math.min(100, Number(promotion.discount_value || 0)) / 100
+    : Number(promotion.discount_value || 0);
+  const capped = Number(promotion.max_discount_amount || 0) > 0
+    ? Math.min(raw, Number(promotion.max_discount_amount))
+    : raw;
+  return Math.min(base, Math.max(0, capped));
+};
+
+const promotionMatchesCheckout = (promotion, { channelId, customerPhone, now = new Date() }) => {
+  if (!promotion?.is_active) return false;
+  if (promotion.channel_id && Number(promotion.channel_id) !== Number(channelId)) return false;
+  if (promotion.requires_member && !customerPhone) return false;
+  if (promotion.valid_from && new Date(promotion.valid_from) > now) return false;
+  if (promotion.valid_until && new Date(promotion.valid_until) < now) return false;
+  if (promotion.start_time && promotion.end_time) {
+    const localTime = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(now);
+    const start = String(promotion.start_time).slice(0, 5);
+    const end = String(promotion.end_time).slice(0, 5);
+    if (!(start <= end ? localTime >= start && localTime <= end : localTime >= start || localTime <= end)) return false;
+  }
+  return true;
+};
+
 const localFrontendOrigins = new Set([
   'http://localhost:3000',
   'http://localhost:3001',
@@ -401,6 +428,18 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS is_sold_out BOOLEAN NOT NULL DEFAULT FALSE');
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS barcode VARCHAR(80)');
     await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS counts_as_loyalty_cup BOOLEAN NOT NULL DEFAULT FALSE');
+    await client.query("ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS production_station VARCHAR(16) NOT NULL DEFAULT 'BAR'");
+    await client.query('ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS prep_minutes INTEGER NOT NULL DEFAULT 5');
+    await client.query(`DO $$ BEGIN
+      ALTER TABLE products ADD CONSTRAINT products_production_station_check CHECK (production_station IN ('BAR', 'KITCHEN', 'BAKERY', 'OTHER'));
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
+    await client.query(`DO $$ BEGIN
+      ALTER TABLE products ADD CONSTRAINT products_prep_minutes_check CHECK (prep_minutes >= 1 AND prep_minutes <= 180);
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
+    await client.query("ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_station VARCHAR(16) NOT NULL DEFAULT 'BAR'");
+    await client.query('ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS target_prep_minutes INTEGER NOT NULL DEFAULT 5');
+    await client.query("ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_status VARCHAR(16) NOT NULL DEFAULT 'PENDING'");
+    await client.query('ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_completed_at TIMESTAMPTZ');
     await client.query('CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx ON products(barcode) WHERE barcode IS NOT NULL');
     await client.query(`
       CREATE TABLE IF NOT EXISTS product_channel_settings (
@@ -438,6 +477,29 @@ const startServer = async () => {
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS coupon_code VARCHAR(64)');
     await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS coupon_id BIGINT REFERENCES coupons(id)');
     await client.query('CREATE INDEX IF NOT EXISTS coupons_active_code_idx ON coupons(UPPER(code)) WHERE is_active = TRUE');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS promotions (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(140) NOT NULL,
+        discount_type VARCHAR(12) NOT NULL CHECK (discount_type IN ('AMOUNT', 'PERCENT')),
+        discount_value NUMERIC(12, 2) NOT NULL CHECK (discount_value > 0),
+        min_order_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (min_order_amount >= 0),
+        max_discount_amount NUMERIC(12, 2),
+        channel_id BIGINT REFERENCES channels(id) ON DELETE SET NULL,
+        requires_member BOOLEAN NOT NULL DEFAULT FALSE,
+        start_time TIME,
+        end_time TIME,
+        valid_from TIMESTAMPTZ,
+        valid_until TIMESTAMPTZ,
+        priority INTEGER NOT NULL DEFAULT 0,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS promotion_id BIGINT REFERENCES promotions(id)');
+    await client.query('ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS promotion_discount_amount NUMERIC(12, 2) NOT NULL DEFAULT 0');
+    await client.query('CREATE INDEX IF NOT EXISTS promotions_active_priority_idx ON promotions(priority DESC, id DESC) WHERE is_active = TRUE');
     await client.query(`
       CREATE TABLE IF NOT EXISTS product_modifier_groups (
         id BIGSERIAL PRIMARY KEY,
@@ -506,7 +568,36 @@ const startServer = async () => {
       ON cash_shifts(opened_by) WHERE status = 'OPEN'
     `);
     await client.query('CREATE INDEX IF NOT EXISTS order_payments_cash_shift_idx ON order_payments(cash_shift_id, status)');
+    await client.query('ALTER TABLE order_payments DROP CONSTRAINT IF EXISTS order_payments_order_id_key');
+    await client.query('CREATE INDEX IF NOT EXISTS order_payments_order_status_idx ON order_payments(order_id, status)');
     await client.query('CREATE INDEX IF NOT EXISTS orders_customer_phone_created_at_idx ON orders(customer_phone, created_at DESC)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS dining_tables (
+        id BIGSERIAL PRIMARY KEY,
+        table_code VARCHAR(32) NOT NULL UNIQUE,
+        display_name VARCHAR(100) NOT NULL DEFAULT '',
+        capacity INTEGER NOT NULL DEFAULT 2 CHECK (capacity > 0 AND capacity <= 100),
+        status VARCHAR(16) NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'OCCUPIED', 'DISABLED')),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS dining_sessions (
+        id BIGSERIAL PRIMARY KEY,
+        table_id BIGINT NOT NULL REFERENCES dining_tables(id) ON DELETE RESTRICT,
+        status VARCHAR(16) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+        opened_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        closed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        opened_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        closed_at TIMESTAMPTZ
+      )
+    `);
+    await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_id BIGINT REFERENCES dining_tables(id) ON DELETE SET NULL');
+    await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS dining_session_id BIGINT REFERENCES dining_sessions(id) ON DELETE SET NULL');
+    await client.query('CREATE INDEX IF NOT EXISTS dining_sessions_open_table_idx ON dining_sessions(table_id) WHERE status = \'OPEN\'');
+    await client.query('CREATE INDEX IF NOT EXISTS orders_dining_session_idx ON orders(dining_session_id, created_at DESC)');
     await client.query(`
       CREATE TABLE IF NOT EXISTS order_returns (
         id BIGSERIAL PRIMARY KEY,
@@ -926,7 +1017,10 @@ app.get('/api/admin/backups/export', requireAuth, requireRoles('ADMIN'), async (
     order_return_items: `SELECT * FROM order_return_items ORDER BY id`,
     order_return_lot_restorations: `SELECT * FROM order_return_lot_restorations ORDER BY id`,
     order_payments: `SELECT * FROM order_payments ORDER BY id`,
+    dining_tables: `SELECT * FROM dining_tables ORDER BY id`,
+    dining_sessions: `SELECT * FROM dining_sessions ORDER BY id`,
     coupons: `SELECT * FROM coupons ORDER BY id`,
+    promotions: `SELECT * FROM promotions ORDER BY id`,
     expenses: `SELECT * FROM expenses ORDER BY id`,
     cash_shifts: `SELECT * FROM cash_shifts ORDER BY id`,
     daily_closings: `SELECT * FROM daily_closings ORDER BY id`,
@@ -1347,6 +1441,53 @@ app.get('/api/users/customers', requireAuth, requireRoles('ADMIN', 'STAFF'), asy
   }
 });
 
+const promotionPayload = (body = {}) => {
+  const name = String(body.name || '').trim().slice(0, 140);
+  const discountType = String(body.discount_type || '').trim().toUpperCase();
+  const discountValue = Number(body.discount_value);
+  const minOrderAmount = Math.max(0, Number(body.min_order_amount || 0));
+  const maxDiscountAmount = body.max_discount_amount === '' || body.max_discount_amount === null || body.max_discount_amount === undefined ? null : Number(body.max_discount_amount);
+  const channelId = body.channel_id ? Number(body.channel_id) : null;
+  const startTime = body.start_time ? String(body.start_time).slice(0, 5) : null;
+  const endTime = body.end_time ? String(body.end_time).slice(0, 5) : null;
+  if (!name || !['AMOUNT', 'PERCENT'].includes(discountType) || !Number.isFinite(discountValue) || discountValue <= 0 || (discountType === 'PERCENT' && discountValue > 100) || !Number.isFinite(minOrderAmount) || (maxDiscountAmount !== null && (!Number.isFinite(maxDiscountAmount) || maxDiscountAmount <= 0)) || (channelId !== null && (!Number.isInteger(channelId) || channelId <= 0))) throw requestError('ข้อมูลโปรโมชั่นไม่ถูกต้อง');
+  return { name, discountType, discountValue, minOrderAmount, maxDiscountAmount, channelId, requiresMember: body.requires_member === true, startTime, endTime, validFrom: body.valid_from || null, validUntil: body.valid_until || null, priority: Number.isInteger(Number(body.priority)) ? Number(body.priority) : 0, isActive: body.is_active !== false };
+};
+
+app.get('/api/promotions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try { const result = await pool.query('SELECT * FROM promotions ORDER BY is_active DESC, priority DESC, id DESC'); res.json({ success: true, data: result.rows }); }
+  catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/promotions/quote', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('pos', 'view'), protectedLookupRateLimiter, async (req, res) => {
+  const channelId = Number(req.body?.channel_id);
+  const amount = Math.max(0, Number(req.body?.amount || 0));
+  const customerPhone = normalizePhone(req.body?.customer_phone);
+  if (!Number.isInteger(channelId) || channelId <= 0 || !Number.isFinite(amount)) return res.status(400).json({ success: false, error: 'ข้อมูลสำหรับคำนวณโปรโมชั่นไม่ถูกต้อง' });
+  try {
+    const result = await pool.query('SELECT * FROM promotions WHERE is_active = TRUE ORDER BY priority DESC, id DESC');
+    const promotion = result.rows.find((item) => promotionMatchesCheckout(item, { channelId, customerPhone }) && promotionDiscountForAmount(item, amount) > 0) || null;
+    res.json({ success: true, data: promotion ? { promotion, discount_amount: promotionDiscountForAmount(promotion, amount) } : { promotion: null, discount_amount: 0 } });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/promotions', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const promotion = promotionPayload(req.body);
+    const result = await pool.query(`INSERT INTO promotions (name, discount_type, discount_value, min_order_amount, max_discount_amount, channel_id, requires_member, start_time, end_time, valid_from, valid_until, priority, is_active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`, [promotion.name, promotion.discountType, promotion.discountValue, promotion.minOrderAmount, promotion.maxDiscountAmount, promotion.channelId, promotion.requiresMember, promotion.startTime, promotion.endTime, promotion.validFrom, promotion.validUntil, promotion.priority, promotion.isActive]);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) { res.status(error.statusCode || 500).json({ success: false, error: error.message }); }
+});
+
+app.put('/api/promotions/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const promotion = promotionPayload(req.body);
+    const result = await pool.query(`UPDATE promotions SET name=$1, discount_type=$2, discount_value=$3, min_order_amount=$4, max_discount_amount=$5, channel_id=$6, requires_member=$7, start_time=$8, end_time=$9, valid_from=$10, valid_until=$11, priority=$12, is_active=$13, updated_at=CURRENT_TIMESTAMP WHERE id=$14 RETURNING *`, [promotion.name, promotion.discountType, promotion.discountValue, promotion.minOrderAmount, promotion.maxDiscountAmount, promotion.channelId, promotion.requiresMember, promotion.startTime, promotion.endTime, promotion.validFrom, promotion.validUntil, promotion.priority, promotion.isActive, req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'ไม่พบโปรโมชั่น' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) { res.status(error.statusCode || 500).json({ success: false, error: error.message }); }
+});
+
 app.post('/api/coupons/validate', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('pos', 'view'), protectedLookupRateLimiter, async (req, res) => {
   const code = normalizeCouponCode(req.body?.code);
   const amount = Math.max(0, Number(req.body?.amount) || 0);
@@ -1553,6 +1694,208 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date() });
 });
 
+const tablePayload = (body = {}) => {
+  const tableCode = String(body.table_code || '').trim().toUpperCase().replace(/\s+/g, '-').slice(0, 32);
+  const displayName = String(body.display_name || '').trim().slice(0, 100);
+  const capacity = Number(body.capacity || 2);
+  const isActive = body.is_active !== false;
+  if (!/^[A-Z0-9_-]{1,32}$/.test(tableCode)) throw requestError('รหัสโต๊ะต้องเป็นตัวอักษรอังกฤษ ตัวเลข หรือ - _', 400);
+  if (!Number.isInteger(capacity) || capacity < 1 || capacity > 100) throw requestError('จำนวนที่นั่งต้องอยู่ระหว่าง 1 ถึง 100', 400);
+  return { tableCode, displayName, capacity, isActive };
+};
+
+app.get('/api/tables', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT dt.*, ds.id AS session_id, ds.opened_at,
+              COALESCE((SELECT COUNT(*) FROM orders o WHERE o.dining_session_id = ds.id AND o.status IN ('COOKING', 'READY')), 0)::int AS active_order_count,
+              COALESCE((SELECT COUNT(*) FROM orders o WHERE o.dining_session_id = ds.id), 0)::int AS order_count
+       FROM dining_tables dt
+       LEFT JOIN LATERAL (
+         SELECT id, opened_at FROM dining_sessions WHERE table_id = dt.id AND status = 'OPEN' ORDER BY opened_at DESC LIMIT 1
+       ) ds ON TRUE
+       WHERE dt.is_active = TRUE OR $1::boolean = TRUE
+       ORDER BY dt.is_active DESC, dt.table_code ASC`,
+      [req.user.role === 'ADMIN']
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/tables', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const table = tablePayload(req.body);
+    const result = await pool.query(
+      `INSERT INTO dining_tables (table_code, display_name, capacity, is_active)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [table.tableCode, table.displayName, table.capacity, table.isActive]
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(error.statusCode || (error.code === '23505' ? 409 : 500)).json({ success: false, error: error.code === '23505' ? 'รหัสโต๊ะนี้มีอยู่แล้ว' : error.message });
+  }
+});
+
+app.put('/api/tables/:id', requireAuth, requireRoles('ADMIN'), async (req, res) => {
+  try {
+    const table = tablePayload(req.body);
+    const result = await pool.query(
+      `UPDATE dining_tables SET table_code = $1, display_name = $2, capacity = $3, is_active = $4,
+       status = CASE WHEN $4 = FALSE THEN 'DISABLED' WHEN status = 'DISABLED' THEN 'AVAILABLE' ELSE status END,
+       updated_at = CURRENT_TIMESTAMP WHERE id = $5 RETURNING *`,
+      [table.tableCode, table.displayName, table.capacity, table.isActive, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, error: 'ไม่พบโต๊ะ' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(error.statusCode || (error.code === '23505' ? 409 : 500)).json({ success: false, error: error.code === '23505' ? 'รหัสโต๊ะนี้มีอยู่แล้ว' : error.message });
+  }
+});
+
+app.post('/api/tables/:id/release', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const tableId = Number(req.params.id);
+    const active = await client.query(
+      `SELECT ds.id FROM dining_sessions ds JOIN orders o ON o.dining_session_id = ds.id
+       WHERE ds.table_id = $1 AND ds.status = 'OPEN' AND o.status IN ('COOKING', 'READY') LIMIT 1 FOR UPDATE`,
+      [tableId]
+    );
+    if (active.rows.length) throw requestError('ยังมีออเดอร์ที่ต้องจัดเตรียมอยู่ จึงปิดโต๊ะไม่ได้', 409);
+    await client.query(`UPDATE dining_sessions SET status = 'CLOSED', closed_by = $1, closed_at = CURRENT_TIMESTAMP WHERE table_id = $2 AND status = 'OPEN'`, [req.user.sub, tableId]);
+    const result = await client.query(`UPDATE dining_tables SET status = 'AVAILABLE', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND is_active = TRUE RETURNING *`, [tableId]);
+    if (!result.rows.length) throw requestError('ไม่พบโต๊ะที่เปิดใช้งาน', 404);
+    await client.query('COMMIT');
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  } finally { client.release(); }
+});
+
+const tableIdFrom = (value) => {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw requestError('รหัสโต๊ะไม่ถูกต้อง');
+  return id;
+};
+
+const lockedTables = async (client, sourceId, targetId) => {
+  if (sourceId === targetId) throw requestError('ต้องเลือกโต๊ะปลายทางคนละโต๊ะ');
+  const result = await client.query(
+    `SELECT * FROM dining_tables WHERE id = ANY($1::bigint[]) FOR UPDATE`,
+    [[sourceId, targetId]]
+  );
+  const source = result.rows.find((table) => Number(table.id) === sourceId);
+  const target = result.rows.find((table) => Number(table.id) === targetId);
+  if (!source || !target || !source.is_active || !target.is_active || target.status === 'DISABLED') {
+    throw requestError('ไม่พบโต๊ะที่เปิดใช้งาน', 404);
+  }
+  return { source, target };
+};
+
+const openTableSession = async (client, tableId) => {
+  const result = await client.query(
+    `SELECT * FROM dining_sessions WHERE table_id = $1 AND status = 'OPEN' ORDER BY opened_at DESC LIMIT 1 FOR UPDATE`,
+    [tableId]
+  );
+  return result.rows[0] || null;
+};
+
+app.post('/api/tables/:id/move', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const sourceId = tableIdFrom(req.params.id);
+    const targetId = tableIdFrom(req.body?.target_table_id);
+    await client.query('BEGIN');
+    const { source, target } = await lockedTables(client, sourceId, targetId);
+    const sourceSession = await openTableSession(client, source.id);
+    if (!sourceSession) throw requestError('โต๊ะต้นทางยังไม่มีบิลที่เปิดอยู่', 409);
+    if (await openTableSession(client, target.id)) throw requestError('โต๊ะปลายทางมีบิลอยู่แล้ว กรุณาใช้การรวมโต๊ะ', 409);
+    await client.query(`UPDATE dining_sessions SET table_id = $1 WHERE id = $2`, [target.id, sourceSession.id]);
+    await client.query(`UPDATE orders SET table_id = $1 WHERE dining_session_id = $2`, [target.id, sourceSession.id]);
+    await client.query(`UPDATE dining_tables SET status = 'AVAILABLE', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [source.id]);
+    await client.query(`UPDATE dining_tables SET status = 'OCCUPIED', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [target.id]);
+    await client.query('COMMIT');
+    res.json({ success: true, message: `ย้ายบิลไปยัง ${target.table_code} แล้ว` });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  } finally { client.release(); }
+});
+
+app.post('/api/tables/:id/merge', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const sourceId = tableIdFrom(req.params.id);
+    const targetId = tableIdFrom(req.body?.target_table_id);
+    await client.query('BEGIN');
+    const { source, target } = await lockedTables(client, sourceId, targetId);
+    const sourceSession = await openTableSession(client, source.id);
+    if (!sourceSession) throw requestError('โต๊ะต้นทางยังไม่มีบิลที่เปิดอยู่', 409);
+    let targetSession = await openTableSession(client, target.id);
+    if (!targetSession) {
+      targetSession = (await client.query(
+        `INSERT INTO dining_sessions (table_id, opened_by) VALUES ($1, $2) RETURNING *`,
+        [target.id, req.user.sub]
+      )).rows[0];
+    }
+    await client.query(
+      `UPDATE orders SET table_id = $1, dining_session_id = $2 WHERE dining_session_id = $3`,
+      [target.id, targetSession.id, sourceSession.id]
+    );
+    await client.query(`UPDATE dining_sessions SET status = 'CLOSED', closed_by = $1, closed_at = CURRENT_TIMESTAMP WHERE id = $2`, [req.user.sub, sourceSession.id]);
+    await client.query(`UPDATE dining_tables SET status = 'AVAILABLE', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [source.id]);
+    await client.query(`UPDATE dining_tables SET status = 'OCCUPIED', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [target.id]);
+    await client.query('COMMIT');
+    res.json({ success: true, message: `รวมบิลเข้ากับ ${target.table_code} แล้ว` });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  } finally { client.release(); }
+});
+
+app.post('/api/tables/:id/split', requireAuth, requireRoles('ADMIN', 'STAFF'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const sourceId = tableIdFrom(req.params.id);
+    const targetId = tableIdFrom(req.body?.target_table_id);
+    const orderIds = [...new Set((Array.isArray(req.body?.order_ids) ? req.body.order_ids : []).map(Number))]
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (!orderIds.length) throw requestError('เลือกอย่างน้อยหนึ่งออเดอร์เพื่อแยกโต๊ะ');
+    await client.query('BEGIN');
+    const { source, target } = await lockedTables(client, sourceId, targetId);
+    const sourceSession = await openTableSession(client, source.id);
+    if (!sourceSession) throw requestError('โต๊ะต้นทางยังไม่มีบิลที่เปิดอยู่', 409);
+    let targetSession = await openTableSession(client, target.id);
+    if (!targetSession) {
+      targetSession = (await client.query(
+        `INSERT INTO dining_sessions (table_id, opened_by) VALUES ($1, $2) RETURNING *`,
+        [target.id, req.user.sub]
+      )).rows[0];
+    }
+    const moved = await client.query(
+      `UPDATE orders SET table_id = $1, dining_session_id = $2
+       WHERE dining_session_id = $3 AND id = ANY($4::bigint[]) RETURNING id`,
+      [target.id, targetSession.id, sourceSession.id, orderIds]
+    );
+    if (moved.rows.length !== orderIds.length) throw requestError('มีออเดอร์บางรายการไม่ได้อยู่ในโต๊ะต้นทาง', 409);
+    const remaining = await client.query(`SELECT COUNT(*)::int AS count FROM orders WHERE dining_session_id = $1`, [sourceSession.id]);
+    if (Number(remaining.rows[0]?.count || 0) === 0) {
+      await client.query(`UPDATE dining_sessions SET status = 'CLOSED', closed_by = $1, closed_at = CURRENT_TIMESTAMP WHERE id = $2`, [req.user.sub, sourceSession.id]);
+      await client.query(`UPDATE dining_tables SET status = 'AVAILABLE', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [source.id]);
+    }
+    await client.query(`UPDATE dining_tables SET status = 'OCCUPIED', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [target.id]);
+    await client.query('COMMIT');
+    res.json({ success: true, message: `แยก ${moved.rows.length} ออเดอร์ไปยัง ${target.table_code} แล้ว` });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  } finally { client.release(); }
+});
+
 // 📌 GET /api/channels - ดึงรายชื่อช่องทางขาย
 app.get('/api/channels', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('sales-channels', 'view'), async (req, res) => {
   try {
@@ -1754,8 +2097,22 @@ app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (
                 )
                 FROM order_payments op
                 WHERE op.order_id = o.id
+                ORDER BY op.id ASC
                 LIMIT 1
               ), 'null'::json) AS payment,
+              COALESCE((
+                SELECT JSON_AGG(JSON_BUILD_OBJECT(
+                  'id', op.id,
+                  'payment_method', op.payment_method,
+                  'paid_amount', op.paid_amount,
+                  'amount_received', op.amount_received,
+                  'change_amount', op.change_amount,
+                  'status', op.status,
+                  'paid_at', op.paid_at
+                ) ORDER BY op.id ASC)
+                FROM order_payments op
+                WHERE op.order_id = o.id
+              ), '[]'::json) AS payments,
               COALESCE(
                 JSON_AGG(JSON_BUILD_OBJECT(
                   'order_item_id', oi.id,
@@ -1765,6 +2122,9 @@ app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (
                   'returned_quantity', COALESCE((SELECT SUM(ori.quantity) FROM order_return_items ori WHERE ori.order_item_id = oi.id), 0),
                   'unit_price', oi.unit_price,
                   'subtotal', oi.subtotal,
+                  'production_station', oi.production_station,
+                  'target_prep_minutes', oi.target_prep_minutes,
+                  'production_status', oi.production_status,
                   'modifiers', COALESCE((
                     SELECT JSON_AGG(JSON_BUILD_OBJECT(
                       'option_id', oim.modifier_option_id,
@@ -1874,12 +2234,19 @@ app.get('/api/sales-breakdown', requireAuth, requireRoles('ADMIN'), requirePermi
       ),
       pool.query(
         `SELECT COALESCE(op.payment_method, 'OTHER') AS payment_method,
-                COUNT(o.id)::int AS order_count,
-                COALESCE(SUM(COALESCE(op.paid_amount, o.gross_amount) - COALESCE(rt.refund_amount, 0)), 0) AS payment_amount,
+                COUNT(DISTINCT o.id)::int AS order_count,
+                COALESCE(SUM(COALESCE(op.paid_amount, o.gross_amount)), 0) - COALESCE(SUM(refunds.refund_amount), 0) AS payment_amount,
                 COALESCE(SUM(COALESCE(op.change_amount, 0)), 0) AS change_amount
          FROM orders o
-         LEFT JOIN order_payments op ON op.order_id = o.id AND op.status = 'PAID'
-         LEFT JOIN (SELECT order_id, SUM(refund_amount) AS refund_amount FROM order_returns GROUP BY order_id) rt ON rt.order_id = o.id
+         LEFT JOIN (
+           SELECT order_id, payment_method, SUM(paid_amount) AS paid_amount, SUM(change_amount) AS change_amount
+           FROM order_payments WHERE status = 'PAID'
+           GROUP BY order_id, payment_method
+         ) op ON op.order_id = o.id
+         LEFT JOIN (
+           SELECT order_id, refund_method, SUM(refund_amount) AS refund_amount
+           FROM order_returns GROUP BY order_id, refund_method
+         ) refunds ON refunds.order_id = o.id AND refunds.refund_method = op.payment_method
          WHERE ${dateFilter} AND o.status <> 'CANCELLED'
          GROUP BY COALESCE(op.payment_method, 'OTHER')
          ORDER BY payment_amount DESC, payment_method ASC`,
@@ -2254,14 +2621,24 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     Number(req.body?.manual_discount_amount ?? req.body?.discount_amount) || 0
   );
   const requestedCouponCode = normalizeCouponCode(req.body?.coupon_code);
+  const requestedPromotionId = req.body?.promotion_id ? Number(req.body.promotion_id) : null;
   const requestedLoyaltyPoints = Number(req.body?.loyalty_points_redeemed || 0);
-  let paymentMethod;
+  const suppliedPayments = Array.isArray(req.body?.payments) && req.body.payments.length
+    ? req.body.payments
+    : [{ payment_method: req.body?.payment_method, paid_amount: undefined, amount_received: req.body?.amount_received }];
+  let requestedPayments;
   try {
-    paymentMethod = normalizePaymentMethod(req.body?.payment_method);
+    requestedPayments = suppliedPayments.map((payment) => ({
+      payment_method: normalizePaymentMethod(payment?.payment_method),
+      paid_amount: payment?.paid_amount === undefined || payment?.paid_amount === '' ? null : Number(payment.paid_amount),
+      amount_received: payment?.amount_received === undefined || payment?.amount_received === '' ? null : Number(payment.amount_received),
+    }));
   } catch (error) {
     return res.status(error.statusCode || 400).json({ success: false, error: error.message });
   }
-  const requestedAmountReceived = req.body?.amount_received;
+  if (requestedPayments.length > 5 || requestedPayments.some((payment) => (payment.paid_amount !== null && (!Number.isFinite(payment.paid_amount) || payment.paid_amount < 0)) || (payment.amount_received !== null && (!Number.isFinite(payment.amount_received) || payment.amount_received < 0)))) {
+    return res.status(400).json({ success: false, error: 'ข้อมูลการชำระเงินไม่ถูกต้อง' });
+  }
   // ตัวอย่าง items: [ { product_id: 1, qty: 2, price: 50.00 } ]
 
   if (!order_no || !channel_id || !items || !items.length) {
@@ -2275,6 +2652,9 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
   }
   if (!Number.isInteger(requestedLoyaltyPoints) || requestedLoyaltyPoints < 0) {
     return res.status(400).json({ success: false, error: 'Loyalty points must be a non-negative whole number' });
+  }
+  if (requestedPromotionId !== null && (!Number.isInteger(requestedPromotionId) || requestedPromotionId <= 0)) {
+    return res.status(400).json({ success: false, error: 'โปรโมชั่นที่เลือกไม่ถูกต้อง' });
   }
 
   const client = await pool.connect();
@@ -2291,6 +2671,24 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     }
     const channelName = channelRes.rows[0].name;
     const gpPercent = parseFloat(channelRes.rows[0].gp_percent);
+    const requestedTableId = req.body?.table_id === undefined || req.body?.table_id === null || req.body?.table_id === '' ? null : Number(req.body.table_id);
+    let tableId = null;
+    let diningSessionId = null;
+    if (requestedTableId !== null) {
+      if (!Number.isInteger(requestedTableId) || requestedTableId <= 0) throw requestError('โต๊ะที่เลือกไม่ถูกต้อง');
+      const tableResult = await client.query(`SELECT * FROM dining_tables WHERE id = $1 AND is_active = TRUE FOR UPDATE`, [requestedTableId]);
+      const table = tableResult.rows[0];
+      if (!table || table.status === 'DISABLED') throw requestError('โต๊ะที่เลือกไม่พร้อมใช้งาน', 409);
+      tableId = table.id;
+      const existingSession = await client.query(`SELECT id FROM dining_sessions WHERE table_id = $1 AND status = 'OPEN' ORDER BY opened_at DESC LIMIT 1 FOR UPDATE`, [tableId]);
+      if (existingSession.rows.length) {
+        diningSessionId = existingSession.rows[0].id;
+      } else {
+        const createdSession = await client.query(`INSERT INTO dining_sessions (table_id, opened_by) VALUES ($1, $2) RETURNING id`, [tableId, req.user.sub]);
+        diningSessionId = createdSession.rows[0].id;
+      }
+      await client.query(`UPDATE dining_tables SET status = 'OCCUPIED', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [tableId]);
+    }
     // Serialize queue allocation so that two orders created together cannot receive the same queue.
     await client.query('SELECT pg_advisory_xact_lock(910246)');
     // A retry after a timeout reaches this point with the same key. Return the original
@@ -2327,10 +2725,10 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
 
     // 2. สร้าง Order เริ่มต้น
     const orderRes = await client.query(
-      `INSERT INTO orders (order_no, channel_id, gross_amount, net_revenue, status, created_at, customer_name, customer_nickname, customer_phone, queue_no, user_id, client_request_id)
-       VALUES ($1, $2, 0, 0, 'COOKING', COALESCE($3::date::timestamp AT TIME ZONE 'Asia/Bangkok', CURRENT_TIMESTAMP), $4, $5, $6, $7, $8, $9)
+      `INSERT INTO orders (order_no, channel_id, gross_amount, net_revenue, status, created_at, customer_name, customer_nickname, customer_phone, queue_no, user_id, client_request_id, table_id, dining_session_id)
+       VALUES ($1, $2, 0, 0, 'COOKING', COALESCE($3::date::timestamp AT TIME ZONE 'Asia/Bangkok', CURRENT_TIMESTAMP), $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id`,
-      [order_no, channel_id, recordDate, customerName || null, customerNickname || null, customerPhone || null, queueNo, req.user.sub, clientRequestId]
+      [order_no, channel_id, recordDate, customerName || null, customerNickname || null, customerPhone || null, queueNo, req.user.sub, clientRequestId, tableId, diningSessionId]
     );
     const orderId = orderRes.rows[0].id;
 
@@ -2342,7 +2740,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
         throw requestError('Order item quantity and price are invalid');
       }
       const productResult = await client.query(
-        `SELECT p.id, p.name, p.is_sold_out, p.counts_as_loyalty_cup, p.price_retail,
+        `SELECT p.id, p.name, p.is_sold_out, p.counts_as_loyalty_cup, p.price_retail, p.production_station, p.prep_minutes,
                 pcs.is_active AS channel_is_active, pcs.price_retail AS channel_price_retail
          FROM products p
          LEFT JOIN product_channel_settings pcs
@@ -2376,9 +2774,9 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
 
       // 3.1 บันทึกรายการลง order_items
       const orderItemResult = await client.query(
-        `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-        [orderId, item.product_id, quantity, finalUnitPrice, subtotal]
+        `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal, production_station, target_prep_minutes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+        [orderId, item.product_id, quantity, finalUnitPrice, subtotal, product.production_station || 'BAR', Number(product.prep_minutes || 5)]
       );
       const orderItemId = orderItemResult.rows[0].id;
       for (const modifier of selectedModifiers) {
@@ -2416,6 +2814,18 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
 
     const manualDiscountAmount = Math.min(subtotalAmount, requestedManualDiscount);
     const couponBaseAmount = subtotalAmount - manualDiscountAmount;
+    let promotionDiscountAmount = 0;
+    let promotionId = null;
+    if (requestedPromotionId) {
+      const promotionResult = await client.query('SELECT * FROM promotions WHERE id = $1 FOR UPDATE', [requestedPromotionId]);
+      const promotion = promotionResult.rows[0];
+      if (!promotion || !promotionMatchesCheckout(promotion, { channelId: channel_id, customerPhone })) {
+        throw requestError('โปรโมชั่นนี้ไม่สามารถใช้กับออเดอร์นี้ได้', 409);
+      }
+      promotionDiscountAmount = promotionDiscountForAmount(promotion, couponBaseAmount);
+      if (promotionDiscountAmount <= 0) throw requestError('ยอดออเดอร์ยังไม่เข้าเงื่อนไขโปรโมชั่น', 409);
+      promotionId = promotion.id;
+    }
     let couponDiscountAmount = 0;
     let couponId = null;
     let couponCode = null;
@@ -2430,13 +2840,13 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
         [requestedCouponCode]
       );
       const coupon = couponResult.rows[0];
-      couponDiscountAmount = validateCouponForAmount(coupon, couponBaseAmount);
+      couponDiscountAmount = validateCouponForAmount(coupon, Math.max(0, couponBaseAmount - promotionDiscountAmount));
       couponId = coupon.id;
       couponCode = coupon.code;
       await client.query('UPDATE coupons SET used_count = used_count + 1 WHERE id = $1', [couponId]);
     }
 
-    const loyaltyBaseAmount = Math.max(0, couponBaseAmount - couponDiscountAmount);
+    const loyaltyBaseAmount = Math.max(0, couponBaseAmount - promotionDiscountAmount - couponDiscountAmount);
     // Read the single settings row inside the order transaction. This makes every
     // earn/redeem calculation use the current admin-configured rules, not client input.
     const currentLoyaltyRules = await getLoyaltyRules(client, { forUpdate: true });
@@ -2478,36 +2888,53 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
       throw requestError('A customer phone number is required to redeem loyalty points');
     }
 
-    const discountAmount = manualDiscountAmount + couponDiscountAmount + loyaltyDiscountAmount;
+    const discountAmount = manualDiscountAmount + promotionDiscountAmount + couponDiscountAmount + loyaltyDiscountAmount;
     const grossAmount = Math.max(0, subtotalAmount - discountAmount);
     const loyaltyPointsEarned = loyaltyAccount && currentLoyaltyRules.earn_enabled
       ? loyaltyPointsForOrder({ amount: grossAmount, cups: totalCups }, currentLoyaltyRules)
       : 0;
 
-    const paidAmount = grossAmount;
-    let amountReceived = paidAmount;
-    let changeAmount = 0;
-    let cashShiftId = null;
-    if (paymentMethod === 'CASH') {
-      amountReceived = requestedAmountReceived === undefined || requestedAmountReceived === null || requestedAmountReceived === ''
-        ? paidAmount
-        : Number(requestedAmountReceived);
-      if (!Number.isFinite(amountReceived) || amountReceived < paidAmount) {
-        throw requestError('Cash received must cover the order total');
-      }
-      changeAmount = amountReceived - paidAmount;
-      if (paidAmount > 0) {
-        const activeShift = await client.query(
-          `SELECT id FROM cash_shifts
-           WHERE opened_by = $1 AND status = 'OPEN'
-           FOR UPDATE`,
-          [req.user.sub]
-        );
-        // A cash sale may be recorded without an open shift. In that case the
-        // payment remains traceable but is intentionally not assigned to a shift.
-        cashShiftId = activeShift.rows[0]?.id || null;
-      }
+    // A legacy caller submits one `payment_method` without an amount. A new
+    // caller submits `payments`, whose totals must exactly settle this order.
+    const isSplitPayment = Array.isArray(req.body?.payments) && req.body.payments.length > 0;
+    const paymentTotal = requestedPayments.reduce((sum, payment) => sum + (payment.paid_amount ?? 0), 0);
+    if (isSplitPayment && Math.abs(paymentTotal - grossAmount) > 0.005) {
+      throw requestError('ยอดชำระรวมต้องเท่ากับยอดสุทธิของออเดอร์');
     }
+    const finalizedPayments = requestedPayments.map((payment) => ({
+      ...payment,
+      paid_amount: payment.paid_amount === null ? grossAmount : payment.paid_amount,
+    }));
+    if (finalizedPayments.some((payment) => payment.paid_amount <= 0) && grossAmount > 0) {
+      throw requestError('ยอดชำระแต่ละช่องทางต้องมากกว่า 0');
+    }
+
+    let cashShiftId = null;
+    if (finalizedPayments.some((payment) => payment.payment_method === 'CASH' && payment.paid_amount > 0)) {
+      const activeShift = await client.query(
+        `SELECT id FROM cash_shifts
+         WHERE opened_by = $1 AND status = 'OPEN'
+         FOR UPDATE`,
+        [req.user.sub]
+      );
+      // A cash sale may be recorded without an open shift. In that case the
+      // payment remains traceable but is intentionally not assigned to a shift.
+      cashShiftId = activeShift.rows[0]?.id || null;
+    }
+    const payments = finalizedPayments.map((payment) => {
+      const amountReceived = payment.payment_method === 'CASH'
+        ? (payment.amount_received === null ? payment.paid_amount : payment.amount_received)
+        : payment.paid_amount;
+      if (!Number.isFinite(amountReceived) || amountReceived < payment.paid_amount) {
+        throw requestError('ยอดเงินสดที่รับต้องไม่น้อยกว่ายอดชำระเงินสด');
+      }
+      return {
+        ...payment,
+        amount_received: amountReceived,
+        change_amount: payment.payment_method === 'CASH' ? amountReceived - payment.paid_amount : 0,
+        cash_shift_id: payment.payment_method === 'CASH' ? cashShiftId : null,
+      };
+    });
 
     // 4. คำนวณ GP, รายรับสุทธิ, และกำไรสุทธิจากยอดหลังหักส่วนลด
     const gpAmount = grossAmount * (gpPercent / 100);
@@ -2517,15 +2944,17 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     // 5. อัปเดตข้อมูลสรุปกลับลงในออเดอร์
     const updatedOrderRes = await client.query(
       `UPDATE orders
-       SET subtotal_amount = $1, manual_discount_amount = $2, coupon_discount_amount = $3,
-           discount_amount = $4, coupon_code = $5, coupon_id = $6,
-           gross_amount = $7, gp_amount = $8, net_revenue = $9, total_cogs = $10, net_profit = $11,
-           loyalty_account_id = $12, loyalty_points_earned = $13, loyalty_points_redeemed = $14,
-           loyalty_discount_amount = $15
-       WHERE id = $16 RETURNING *`,
+       SET subtotal_amount = $1, manual_discount_amount = $2, promotion_discount_amount = $3, promotion_id = $4, coupon_discount_amount = $5,
+           discount_amount = $6, coupon_code = $7, coupon_id = $8,
+           gross_amount = $9, gp_amount = $10, net_revenue = $11, total_cogs = $12, net_profit = $13,
+           loyalty_account_id = $14, loyalty_points_earned = $15, loyalty_points_redeemed = $16,
+           loyalty_discount_amount = $17
+       WHERE id = $18 RETURNING *`,
       [
         subtotalAmount,
         manualDiscountAmount,
+        promotionDiscountAmount,
+        promotionId,
         couponDiscountAmount,
         discountAmount,
         couponCode,
@@ -2543,12 +2972,22 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
       ]
     );
 
-    await client.query(
-      `INSERT INTO order_payments
-       (order_id, cash_shift_id, paid_by, payment_method, paid_amount, amount_received, change_amount)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [orderId, cashShiftId, req.user.sub, paymentMethod, paidAmount, amountReceived, changeAmount]
-    );
+    for (const payment of payments) {
+      await client.query(
+        `INSERT INTO order_payments
+         (order_id, cash_shift_id, paid_by, payment_method, paid_amount, amount_received, change_amount)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          orderId,
+          payment.cash_shift_id,
+          req.user.sub,
+          payment.payment_method,
+          payment.paid_amount,
+          payment.amount_received,
+          payment.change_amount,
+        ]
+      );
+    }
 
     if (loyaltyAccount) {
       await client.query(
@@ -2580,7 +3019,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     // ยืนยันการทำ Transaction ลง Database
     await client.query('COMMIT');
 
-    const createdOrder = updatedOrderRes.rows[0];
+    const createdOrder = { ...updatedOrderRes.rows[0], payments };
 
     // 6. ส่ง Real-time Event ให้ทุก Client (หน้าเว็บ 3D / หน้า POS / หน้า Kitchen)
     io.to('operations').emit('new_order_created', {
@@ -2643,6 +3082,13 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), requireP
     if (orderResult.rows[0].status === 'CANCELLED') throw new Error('Cancelled sales records cannot be edited');
     if (Number(orderResult.rows[0].loyalty_points_earned || 0) || Number(orderResult.rows[0].loyalty_points_redeemed || 0)) {
       throw new Error('Loyalty-linked orders cannot be edited. Cancel and create a replacement order instead.');
+    }
+    const paymentCount = await client.query(
+      `SELECT COUNT(*)::int AS count FROM order_payments WHERE order_id = $1 AND status = 'PAID'`,
+      [id]
+    );
+    if (Number(paymentCount.rows[0]?.count || 0) > 1) {
+      throw requestError('ออเดอร์ที่แยกชำระแล้วไม่สามารถแก้ไขรายการได้ กรุณายกเลิกแล้วสร้างใหม่', 409);
     }
 
     const channelResult = await client.query('SELECT gp_percent FROM channels WHERE id = $1', [channel_id]);
@@ -2865,6 +3311,38 @@ app.delete('/api/orders/:id', requireAuth, requireRoles('ADMIN'), async (req, re
 });
 
 // 📌 PUT /api/orders/:id/status - อัปเดตสถานะออเดอร์ (COOKING -> READY -> COMPLETED)
+app.put('/api/orders/:id/kitchen-stations/:station', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('kitchen', 'update'), async (req, res) => {
+  const orderId = Number(req.params.id);
+  const station = String(req.params.station || '').trim().toUpperCase();
+  const productionStatus = String(req.body?.production_status || '').trim().toUpperCase();
+  if (!Number.isInteger(orderId) || !['BAR', 'KITCHEN', 'BAKERY', 'OTHER'].includes(station) || !['PENDING', 'READY'].includes(productionStatus)) {
+    return res.status(400).json({ success: false, error: 'ข้อมูลจุดผลิตหรือสถานะไม่ถูกต้อง' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const orderResult = await client.query(`SELECT id, status FROM orders WHERE id = $1 FOR UPDATE`, [orderId]);
+    if (!orderResult.rows.length) throw requestError('ไม่พบคำสั่งซื้อ', 404);
+    if (['CANCELLED', 'COMPLETED', 'RETURNED'].includes(orderResult.rows[0].status)) throw requestError('คำสั่งซื้อนี้ปิดงานแล้ว', 409);
+    const items = await client.query(
+      `UPDATE order_items SET production_status = $1,
+         production_completed_at = CASE WHEN $1 = 'READY' THEN CURRENT_TIMESTAMP ELSE NULL END
+       WHERE order_id = $2 AND production_station = $3 RETURNING id`,
+      [productionStatus, orderId, station]
+    );
+    if (!items.rows.length) throw requestError('ไม่พบรายการของจุดผลิตนี้', 404);
+    const outstanding = await client.query(`SELECT COUNT(*)::int AS count FROM order_items WHERE order_id = $1 AND production_status <> 'READY'`, [orderId]);
+    const orderStatus = Number(outstanding.rows[0]?.count || 0) === 0 ? 'READY' : 'COOKING';
+    await client.query(`UPDATE orders SET status = $1 WHERE id = $2`, [orderStatus, orderId]);
+    await client.query('COMMIT');
+    io.to('operations').emit('order_status_updated', { orderId, status: orderStatus });
+    res.json({ success: true, data: { order_id: orderId, production_station: station, production_status: productionStatus, order_status: orderStatus } });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  } finally { client.release(); }
+});
+
 app.put('/api/orders/:id/status', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePermission('orders', 'update'), async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
