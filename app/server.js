@@ -127,6 +127,12 @@ const createRateLimiter = ({ name, windowMs, max, key = clientAddress }) => {
 const apiRateLimiter = createRateLimiter({ name: 'API', windowMs: 60 * 1000, max: 360 });
 const loginRateLimiter = createRateLimiter({ name: 'login', windowMs: 15 * 60 * 1000, max: 12 });
 const registrationRateLimiter = createRateLimiter({ name: 'registration', windowMs: 60 * 60 * 1000, max: 5 });
+const sessionUnlockRateLimiter = createRateLimiter({
+  name: 'session unlock',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  key: (req) => req.user?.sub ? `user:${req.user.sub}` : clientAddress(req),
+});
 const publicLookupRateLimiter = createRateLimiter({ name: 'public lookup', windowMs: 60 * 1000, max: 30 });
 const protectedLookupRateLimiter = createRateLimiter({
   name: 'lookup',
@@ -225,7 +231,7 @@ const auditPayload = (value, depth = 0) => {
 };
 const shouldAuditRequest = (req) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) || !req.user) return false;
-  const ignoredPaths = new Set(['/api/auth/login', '/api/auth/register', '/api/coupons/validate', '/api/loyalty/lookup']);
+  const ignoredPaths = new Set(['/api/auth/login', '/api/auth/register', '/api/auth/verify-password', '/api/coupons/validate', '/api/loyalty/lookup']);
   return req.path.startsWith('/api/') && !ignoredPaths.has(req.path);
 };
 const recordAuditLog = (req, statusCode) => {
@@ -942,6 +948,24 @@ app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
     res.json({ success: true, data: { user: publicUser(user), token: createToken(user) } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Re-check the signed-in user's password when the screen was locked for inactivity.
+// This deliberately returns no new token, so the original session expiry remains in force.
+app.post('/api/auth/verify-password', requireAuth, sessionUnlockRateLimiter, async (req, res) => {
+  const password = String(req.body?.password || '');
+  if (!password) return res.status(400).json({ success: false, error: 'Password is required' });
+  try {
+    const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.sub]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ success: false, error: 'Session is no longer valid' });
+    if (!verifyPassword(password, user.password_hash)) {
+      return res.status(403).json({ success: false, error: 'รหัสผ่านไม่ถูกต้อง' });
+    }
+    return res.json({ success: true, data: { verified: true } });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
