@@ -5,6 +5,7 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const pool = require('../config/db');
 const { hashPassword, verifyPassword, needsPasswordUpgrade, createToken, verifyToken, requireAuth, requireRoles } = require('../middleware/auth');
+const { createApiEnvelopeMiddleware } = require('../middleware/apiEnvelope');
 
 const app = express();
 const server = http.createServer(app);
@@ -85,6 +86,7 @@ const allowedFrontendOrigins = new Set([
 ]);
 const isAllowedOrigin = (origin) => !origin || allowedFrontendOrigins.has(origin);
 const corsOrigin = (origin, callback) => callback(null, isAllowedOrigin(origin));
+const apiEnvelopeEncryptionEnabled = process.env.API_PAYLOAD_ENCRYPTION_ENABLED === 'true';
 
 const clientAddress = (req) => {
   const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -855,7 +857,8 @@ app.disable('x-powered-by');
 app.use(cors({
   origin: corsOrigin,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-StockPOS-Envelope'],
+  exposedHeaders: ['X-StockPOS-Envelope'],
   maxAge: 600,
 }));
 app.use((req, res, next) => {
@@ -874,6 +877,7 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '1mb' }));
+app.use(createApiEnvelopeMiddleware({ enabled: apiEnvelopeEncryptionEnabled }));
 app.use('/api', apiRateLimiter);
 
 // Disable caching for API responses to avoid 304 Not Modified in clients

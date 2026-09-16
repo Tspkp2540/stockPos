@@ -174,6 +174,8 @@ Frontend จะแนบ `Idempotency-Key` ที่มีความยาว 
 
 ระบบจำกัดจำนวนคำขอต่อ IP/ผู้ใช้ในหน่วยความจำ: ทุก `/api` สูงสุด 360 ครั้ง/นาที, login 12 ครั้ง/15 นาที, สมัครสมาชิก 5 ครั้ง/ชั่วโมง, public order lookup 30 ครั้ง/นาที และตรวจคูปอง/แต้ม 90 ครั้ง/นาทีต่อผู้ใช้ เมื่อเกินจะตอบ `429` พร้อม `Retry-After` และรหัส `RATE_LIMITED`
 
+เมื่อกำหนด `API_PAYLOAD_ENCRYPTION_ENABLED=true` Backend จะรับ payload และตอบ JSON ของ API ที่มี Bearer session เป็น AES-256-GCM envelope โดยผูกกับ token และ HTTP method/path เดียวกัน จึงแก้ไขหรือย้าย payload ไปใช้กับ endpoint อื่นไม่ได้ Frontend ที่จะใช้งานต้อง build พร้อม `VITE_API_PAYLOAD_ENCRYPTION_ENABLED=true` เสมอ ส่วน login, register, health check, public lookup และ Socket.IO ใช้ HTTPS/TLS ตามปกติ เนื่องจากยังไม่มี session token สำหรับสร้าง envelope และ development ปิดความสามารถนี้ไว้
+
 ## Real-time events
 
 Client เชื่อมต่อ Socket.IO โดยส่ง token ใน `auth.token` ผู้ใช้ทั่วไปจะอยู่ใน room ของตนเอง ส่วน Admin/Staff จะอยู่ใน room `operations` สำหรับรับออเดอร์ใหม่ การเปลี่ยนสถานะ และการยกเลิกออเดอร์
