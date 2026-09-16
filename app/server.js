@@ -859,9 +859,18 @@ app.use(cors({
   maxAge: 600,
 }));
 app.use((req, res, next) => {
+  const forwardedProtocol = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const isSecureRequest = req.secure || forwardedProtocol === 'https';
   res.set('X-Content-Type-Options', 'nosniff');
   res.set('X-Frame-Options', 'DENY');
   res.set('Referrer-Policy', 'no-referrer');
+  // API responses are JSON only. These headers prevent browser contexts from framing
+  // or interpreting an API response as active page content.
+  res.set('Content-Security-Policy', "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+  res.set('Permissions-Policy', 'camera=(), geolocation=(), microphone=()');
+  res.set('Cross-Origin-Resource-Policy', 'same-site');
+  // Railway terminates TLS at its proxy. Send HSTS only after the browser reached us via HTTPS.
+  if (isSecureRequest) res.set('Strict-Transport-Security', 'max-age=31536000');
   next();
 });
 app.use(express.json({ limit: '1mb' }));
