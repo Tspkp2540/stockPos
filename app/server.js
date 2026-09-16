@@ -3373,18 +3373,18 @@ app.put('/api/orders/:id/kitchen-stations/:station', requireAuth, requireRoles('
       throw requestError('สถานะห้องครัวต้องดำเนินการตามลำดับ รอรับงาน → รับออเดอร์ → กำลังทำ → เสร็จสิ้น', 409);
     }
     const items = await client.query(
-      `UPDATE order_items SET production_status = $1,
+      `UPDATE order_items SET production_status = $1::varchar,
          production_accepted_at = CASE
-           WHEN $1 = 'PENDING' THEN NULL
-           WHEN $1 = 'ACCEPTED' THEN CURRENT_TIMESTAMP
+           WHEN $1::varchar = 'PENDING' THEN NULL
+           WHEN $1::varchar = 'ACCEPTED' THEN CURRENT_TIMESTAMP
            ELSE COALESCE(production_accepted_at, CURRENT_TIMESTAMP)
          END,
          production_started_at = CASE
-           WHEN $1 IN ('PENDING', 'ACCEPTED') THEN NULL
-           WHEN $1 = 'IN_PROGRESS' THEN CURRENT_TIMESTAMP
+           WHEN $1::varchar IN ('PENDING', 'ACCEPTED') THEN NULL
+           WHEN $1::varchar = 'IN_PROGRESS' THEN CURRENT_TIMESTAMP
            ELSE COALESCE(production_started_at, CURRENT_TIMESTAMP)
          END,
-         production_completed_at = CASE WHEN $1 = 'READY' THEN CURRENT_TIMESTAMP ELSE NULL END
+         production_completed_at = CASE WHEN $1::varchar = 'READY' THEN CURRENT_TIMESTAMP ELSE NULL END
        WHERE order_id = $2 AND production_station = $3
        RETURNING id, production_accepted_at, production_started_at, production_completed_at`,
       [productionStatus, orderId, station]
