@@ -439,7 +439,11 @@ const startServer = async () => {
     await client.query("ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_station VARCHAR(16) NOT NULL DEFAULT 'BAR'");
     await client.query('ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS target_prep_minutes INTEGER NOT NULL DEFAULT 5');
     await client.query("ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_status VARCHAR(16) NOT NULL DEFAULT 'PENDING'");
+    await client.query('ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_accepted_at TIMESTAMPTZ');
+    await client.query('ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_started_at TIMESTAMPTZ');
     await client.query('ALTER TABLE IF EXISTS order_items ADD COLUMN IF NOT EXISTS production_completed_at TIMESTAMPTZ');
+    await client.query('ALTER TABLE IF EXISTS order_items DROP CONSTRAINT IF EXISTS order_items_production_status_check');
+    await client.query("ALTER TABLE IF EXISTS order_items ADD CONSTRAINT order_items_production_status_check CHECK (production_status IN ('PENDING', 'ACCEPTED', 'IN_PROGRESS', 'READY'))");
     await client.query('CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx ON products(barcode) WHERE barcode IS NOT NULL');
     await client.query(`
       CREATE TABLE IF NOT EXISTS product_channel_settings (
@@ -2125,6 +2129,9 @@ app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (
                   'production_station', oi.production_station,
                   'target_prep_minutes', oi.target_prep_minutes,
                   'production_status', oi.production_status,
+                  'production_accepted_at', oi.production_accepted_at,
+                  'production_started_at', oi.production_started_at,
+                  'production_completed_at', oi.production_completed_at,
                   'modifiers', COALESCE((
                     SELECT JSON_AGG(JSON_BUILD_OBJECT(
                       'option_id', oim.modifier_option_id,
@@ -3024,6 +3031,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     const createdItemsResult = await client.query(
       `SELECT oi.id AS order_item_id, oi.product_id, p.name, oi.quantity, oi.unit_price,
               oi.production_station, oi.target_prep_minutes, oi.production_status,
+              oi.production_accepted_at, oi.production_started_at, oi.production_completed_at,
               COALESCE(
                 json_agg(
                   json_build_object('id', oim.modifier_option_id, 'name', oim.option_name,
@@ -3336,7 +3344,8 @@ app.put('/api/orders/:id/kitchen-stations/:station', requireAuth, requireRoles('
   const orderId = Number(req.params.id);
   const station = String(req.params.station || '').trim().toUpperCase();
   const productionStatus = String(req.body?.production_status || '').trim().toUpperCase();
-  if (!Number.isInteger(orderId) || !['BAR', 'KITCHEN', 'BAKERY', 'OTHER'].includes(station) || !['PENDING', 'READY'].includes(productionStatus)) {
+  const productionStages = ['PENDING', 'ACCEPTED', 'IN_PROGRESS', 'READY'];
+  if (!Number.isInteger(orderId) || !['BAR', 'KITCHEN', 'BAKERY', 'OTHER'].includes(station) || !productionStages.includes(productionStatus)) {
     return res.status(400).json({ success: false, error: 'ข้อมูลจุดผลิตหรือสถานะไม่ถูกต้อง' });
   }
   const client = await pool.connect();
@@ -3345,19 +3354,47 @@ app.put('/api/orders/:id/kitchen-stations/:station', requireAuth, requireRoles('
     const orderResult = await client.query(`SELECT id, status FROM orders WHERE id = $1 FOR UPDATE`, [orderId]);
     if (!orderResult.rows.length) throw requestError('ไม่พบคำสั่งซื้อ', 404);
     if (['CANCELLED', 'COMPLETED', 'RETURNED'].includes(orderResult.rows[0].status)) throw requestError('คำสั่งซื้อนี้ปิดงานแล้ว', 409);
+    const stationItems = await client.query(
+      `SELECT production_status FROM order_items
+       WHERE order_id = $1 AND production_station = $2 FOR UPDATE`,
+      [orderId, station]
+    );
+    if (!stationItems.rows.length) throw requestError('ไม่พบรายการของจุดผลิตนี้', 404);
+    const currentStage = stationItems.rows
+      .map((item) => String(item.production_status || 'PENDING'))
+      .sort((left, right) => productionStages.indexOf(left) - productionStages.indexOf(right))[0];
+    const allowedNextStages = {
+      PENDING: ['ACCEPTED'],
+      ACCEPTED: ['PENDING', 'IN_PROGRESS'],
+      IN_PROGRESS: ['ACCEPTED', 'READY'],
+      READY: ['IN_PROGRESS'],
+    };
+    if (!allowedNextStages[currentStage]?.includes(productionStatus)) {
+      throw requestError('สถานะห้องครัวต้องดำเนินการตามลำดับ รอรับงาน → รับออเดอร์ → กำลังทำ → เสร็จสิ้น', 409);
+    }
     const items = await client.query(
       `UPDATE order_items SET production_status = $1,
+         production_accepted_at = CASE
+           WHEN $1 = 'PENDING' THEN NULL
+           WHEN $1 = 'ACCEPTED' THEN CURRENT_TIMESTAMP
+           ELSE COALESCE(production_accepted_at, CURRENT_TIMESTAMP)
+         END,
+         production_started_at = CASE
+           WHEN $1 IN ('PENDING', 'ACCEPTED') THEN NULL
+           WHEN $1 = 'IN_PROGRESS' THEN CURRENT_TIMESTAMP
+           ELSE COALESCE(production_started_at, CURRENT_TIMESTAMP)
+         END,
          production_completed_at = CASE WHEN $1 = 'READY' THEN CURRENT_TIMESTAMP ELSE NULL END
-       WHERE order_id = $2 AND production_station = $3 RETURNING id`,
+       WHERE order_id = $2 AND production_station = $3
+       RETURNING id, production_accepted_at, production_started_at, production_completed_at`,
       [productionStatus, orderId, station]
     );
-    if (!items.rows.length) throw requestError('ไม่พบรายการของจุดผลิตนี้', 404);
     const outstanding = await client.query(`SELECT COUNT(*)::int AS count FROM order_items WHERE order_id = $1 AND production_status <> 'READY'`, [orderId]);
     const orderStatus = Number(outstanding.rows[0]?.count || 0) === 0 ? 'READY' : 'COOKING';
     await client.query(`UPDATE orders SET status = $1 WHERE id = $2`, [orderStatus, orderId]);
     await client.query('COMMIT');
     io.to('operations').emit('order_status_updated', { orderId, status: orderStatus });
-    res.json({ success: true, data: { order_id: orderId, production_station: station, production_status: productionStatus, order_status: orderStatus } });
+    res.json({ success: true, data: { order_id: orderId, production_station: station, production_status: productionStatus, order_status: orderStatus, ...items.rows[0] } });
   } catch (error) {
     await client.query('ROLLBACK');
     res.status(error.statusCode || 500).json({ success: false, error: error.message });
