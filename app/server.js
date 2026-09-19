@@ -26,6 +26,7 @@ const {
   validateLoyaltySettings,
 } = require('../utils/commerceRules');
 const { permissionActions, permissionMenus, ROLE_PERMISSION_DEFAULTS, sanitizePermissions } = require('../utils/rolePermissions');
+const { settlePayments } = require('../utils/paymentSettlement');
 
 const promotionDiscountForAmount = (promotion, amount) => {
   const base = Math.max(0, Number(amount) || 0);
@@ -571,6 +572,7 @@ const startServer = async () => {
         paid_amount NUMERIC(12, 2) NOT NULL CHECK (paid_amount >= 0),
         amount_received NUMERIC(12, 2) NOT NULL CHECK (amount_received >= 0),
         change_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (change_amount >= 0),
+        change_method VARCHAR(16) CHECK (change_method IS NULL OR change_method IN ('CASH')),
         status VARCHAR(12) NOT NULL DEFAULT 'PAID' CHECK (status IN ('PAID', 'VOIDED')),
         paid_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
@@ -581,6 +583,7 @@ const startServer = async () => {
     `);
     await client.query('CREATE INDEX IF NOT EXISTS order_payments_cash_shift_idx ON order_payments(cash_shift_id, status)');
     await client.query('ALTER TABLE order_payments DROP CONSTRAINT IF EXISTS order_payments_order_id_key');
+    await client.query("ALTER TABLE order_payments ADD COLUMN IF NOT EXISTS change_method VARCHAR(16) CHECK (change_method IS NULL OR change_method IN ('CASH'))");
     await client.query('CREATE INDEX IF NOT EXISTS order_payments_order_status_idx ON order_payments(order_id, status)');
     await client.query('CREATE INDEX IF NOT EXISTS orders_customer_phone_created_at_idx ON orders(customer_phone, created_at DESC)');
     await client.query(`
@@ -1999,6 +2002,8 @@ const shiftWithCashSales = `
   SELECT cs.*, (
     COALESCE((SELECT SUM(op.paid_amount) FROM order_payments op
       WHERE op.cash_shift_id = cs.id AND op.payment_method = 'CASH' AND op.status = 'PAID'), 0)
+    - COALESCE((SELECT SUM(op.change_amount) FROM order_payments op
+      WHERE op.cash_shift_id = cs.id AND op.payment_method <> 'CASH' AND op.change_method = 'CASH' AND op.status = 'PAID'), 0)
     - COALESCE((SELECT SUM(orr.refund_amount) FROM order_returns orr
       WHERE orr.cash_shift_id = cs.id AND orr.refund_method = 'CASH'), 0)
   ) AS cash_sales
@@ -2026,6 +2031,7 @@ app.get('/api/shifts', requireAuth, requireRoles('ADMIN'), requirePermission('ca
       `SELECT cs.*, opened_user.full_name AS opened_by_name,
         closed_user.full_name AS closed_by_name, (
           COALESCE((SELECT SUM(op.paid_amount) FROM order_payments op WHERE op.cash_shift_id = cs.id AND op.payment_method = 'CASH' AND op.status = 'PAID'), 0)
+          - COALESCE((SELECT SUM(op.change_amount) FROM order_payments op WHERE op.cash_shift_id = cs.id AND op.payment_method <> 'CASH' AND op.change_method = 'CASH' AND op.status = 'PAID'), 0)
           - COALESCE((SELECT SUM(orr.refund_amount) FROM order_returns orr WHERE orr.cash_shift_id = cs.id AND orr.refund_method = 'CASH'), 0)
         ) AS cash_sales
        FROM cash_shifts cs
@@ -2079,6 +2085,7 @@ app.post('/api/shifts/:id/close', requireAuth, requireRoles('ADMIN', 'STAFF'), r
     const cashResult = await client.query(
       `SELECT (
         COALESCE((SELECT SUM(paid_amount) FROM order_payments WHERE cash_shift_id = $1 AND payment_method = 'CASH' AND status = 'PAID'), 0)
+        - COALESCE((SELECT SUM(change_amount) FROM order_payments WHERE cash_shift_id = $1 AND payment_method <> 'CASH' AND change_method = 'CASH' AND status = 'PAID'), 0)
         - COALESCE((SELECT SUM(refund_amount) FROM order_returns WHERE cash_shift_id = $1 AND refund_method = 'CASH'), 0)
       ) AS cash_sales`,
       [shift.id]
@@ -2133,6 +2140,7 @@ app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (
                   'paid_amount', op.paid_amount,
                   'amount_received', op.amount_received,
                   'change_amount', op.change_amount,
+                  'change_method', op.change_method,
                   'status', op.status,
                   'paid_at', op.paid_at
                 )
@@ -2148,6 +2156,7 @@ app.get('/api/orders', requireAuth, requirePermission('orders', 'view'), async (
                   'paid_amount', op.paid_amount,
                   'amount_received', op.amount_received,
                   'change_amount', op.change_amount,
+                  'change_method', op.change_method,
                   'status', op.status,
                   'paid_at', op.paid_at
                 ) ORDER BY op.id ASC)
@@ -2939,22 +2948,12 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
       : 0;
 
     // A legacy caller submits one `payment_method` without an amount. A new
-    // caller submits `payments`, whose totals must exactly settle this order.
+    // caller submits `payments`, whose allocated totals must exactly settle this order.
     const isSplitPayment = Array.isArray(req.body?.payments) && req.body.payments.length > 0;
-    const paymentTotal = requestedPayments.reduce((sum, payment) => sum + (payment.paid_amount ?? 0), 0);
-    if (isSplitPayment && Math.abs(paymentTotal - grossAmount) > 0.005) {
-      throw requestError('ยอดชำระรวมต้องเท่ากับยอดสุทธิของออเดอร์');
-    }
-    const finalizedPayments = requestedPayments.map((payment) => ({
-      ...payment,
-      paid_amount: payment.paid_amount === null ? grossAmount : payment.paid_amount,
-    }));
-    if (finalizedPayments.some((payment) => payment.paid_amount <= 0) && grossAmount > 0) {
-      throw requestError('ยอดชำระแต่ละช่องทางต้องมากกว่า 0');
-    }
+    const settledPayments = settlePayments({ requestedPayments, grossAmount, isSplitPayment });
 
     let cashShiftId = null;
-    if (finalizedPayments.some((payment) => payment.payment_method === 'CASH' && payment.paid_amount > 0)) {
+    if (settledPayments.some((payment) => payment.requires_cash_shift)) {
       const activeShift = await client.query(
         `SELECT id FROM cash_shifts
          WHERE opened_by = $1 AND status = 'OPEN'
@@ -2965,20 +2964,10 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
       // payment remains traceable but is intentionally not assigned to a shift.
       cashShiftId = activeShift.rows[0]?.id || null;
     }
-    const payments = finalizedPayments.map((payment) => {
-      const amountReceived = payment.payment_method === 'CASH'
-        ? (payment.amount_received === null ? payment.paid_amount : payment.amount_received)
-        : payment.paid_amount;
-      if (!Number.isFinite(amountReceived) || amountReceived < payment.paid_amount) {
-        throw requestError('ยอดเงินสดที่รับต้องไม่น้อยกว่ายอดชำระเงินสด');
-      }
-      return {
-        ...payment,
-        amount_received: amountReceived,
-        change_amount: payment.payment_method === 'CASH' ? amountReceived - payment.paid_amount : 0,
-        cash_shift_id: payment.payment_method === 'CASH' ? cashShiftId : null,
-      };
-    });
+    const payments = settledPayments.map((payment) => ({
+      ...payment,
+      cash_shift_id: payment.requires_cash_shift ? cashShiftId : null,
+    }));
 
     // 4. คำนวณ GP, รายรับสุทธิ, และกำไรสุทธิจากยอดหลังหักส่วนลด
     const gpAmount = grossAmount * (gpPercent / 100);
@@ -3019,8 +3008,8 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
     for (const payment of payments) {
       await client.query(
         `INSERT INTO order_payments
-         (order_id, cash_shift_id, paid_by, payment_method, paid_amount, amount_received, change_amount)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         (order_id, cash_shift_id, paid_by, payment_method, paid_amount, amount_received, change_amount, change_method)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [
           orderId,
           payment.cash_shift_id,
@@ -3029,6 +3018,7 @@ app.post('/api/orders', requireAuth, requireRoles('ADMIN', 'STAFF'), requirePerm
           payment.paid_amount,
           payment.amount_received,
           payment.change_amount,
+          payment.change_method,
         ]
       );
     }
@@ -3267,8 +3257,12 @@ app.put('/api/orders/:id', requireAuth, requireRoles('ADMIN', 'STAFF'), requireP
     await client.query(
       `UPDATE order_payments
        SET paid_amount = $1,
-           amount_received = CASE WHEN payment_method = 'CASH' THEN GREATEST(amount_received, $1) ELSE $1 END,
-           change_amount = CASE WHEN payment_method = 'CASH' THEN GREATEST(amount_received, $1) - $1 ELSE 0 END
+           amount_received = GREATEST(amount_received, $1),
+           change_amount = GREATEST(amount_received, $1) - $1,
+           change_method = CASE
+             WHEN payment_method IN ('CASH', 'QR', 'TRANSFER') AND GREATEST(amount_received, $1) > $1 THEN 'CASH'
+             ELSE NULL
+           END
        WHERE order_id = $2 AND status = 'PAID'`,
       [grossAmount, id]
     );
