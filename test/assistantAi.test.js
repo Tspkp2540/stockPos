@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { askSystemAssistant, extractOutputText, normalizeView, safetyIdentifierFor } = require('../utils/assistantAi');
+const { askSystemAssistant, extractOutputText, normalizeView, providerFailure, safetyIdentifierFor } = require('../utils/assistantAi');
 
 test('extractOutputText reads a Responses API output message', () => {
   assert.equal(extractOutputText({ output: [{ content: [{ type: 'output_text', text: 'ตอบแล้ว' }] }] }), 'ตอบแล้ว');
@@ -27,4 +27,13 @@ test('assistant rejects missing configuration and questions that are too long', 
   await assert.rejects(() => askSystemAssistant({ apiKey: 'key', question: 'ก'.repeat(801) }), { code: 'ASSISTANT_QUESTION_TOO_LONG' });
   assert.equal(normalizeView('kitchen'), 'kitchen');
   assert.equal(normalizeView('unknown'), 'home');
+});
+
+test('assistant translates upstream failures into safe, actionable messages', () => {
+  assert.deepEqual(
+    { statusCode: providerFailure(401).statusCode, code: providerFailure(401).code },
+    { statusCode: 503, code: 'ASSISTANT_API_KEY_INVALID' },
+  );
+  assert.equal(providerFailure(429, { error: { code: 'insufficient_quota' } }).code, 'ASSISTANT_QUOTA_EXHAUSTED');
+  assert.equal(providerFailure(404, { error: { code: 'model_not_found' } }).code, 'ASSISTANT_MODEL_UNAVAILABLE');
 });

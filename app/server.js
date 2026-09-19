@@ -1015,6 +1015,11 @@ app.post('/api/assistant/chat', requireAuth, assistantRateLimiter, async (req, r
     return res.json({ success: true, data: result });
   } catch (error) {
     const statusCode = Number(error.statusCode) || 502;
+    console.error('AI assistant request failed', {
+      statusCode,
+      code: error.code || 'ASSISTANT_ERROR',
+      provider: error.provider || null,
+    });
     return res.status(statusCode).json({
       success: false,
       error: error.message || 'ไม่สามารถตอบคำถามได้ในขณะนี้',

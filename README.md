@@ -190,6 +190,8 @@ OPENAI_ASSISTANT_MODEL=gpt-5-mini
 
 เก็บ `OPENAI_API_KEY` เฉพาะใน Railway Backend ห้ามใส่ใน Frontend หรือ commit ลง Git ระบบส่งคำขอด้วย OpenAI Responses API โดยตั้ง `store: false` เพื่อไม่เก็บบทสนทนาไว้ที่ผู้ให้บริการ
 
+หากผู้ช่วยตอบด้วยรหัสผิดพลาด ให้ตรวจสอบตามนี้: `ASSISTANT_API_KEY_INVALID` = คีย์ผิดหรือถูกปิด, `ASSISTANT_QUOTA_EXHAUSTED` = ยังไม่ได้เปิด Billing/เครดิตไม่พอ, `ASSISTANT_MODEL_UNAVAILABLE` = ชื่อโมเดลไม่พร้อมใช้กับ Project, และ `ASSISTANT_NETWORK_ERROR` = Railway ติดต่อ OpenAI ไม่ได้ ระบบจะบันทึกเฉพาะ HTTP status และรหัสผิดพลาดใน Railway log โดยไม่บันทึกคีย์หรือคำถาม
+
 ## Real-time events
 
 Client เชื่อมต่อ Socket.IO โดยส่ง token ใน `auth.token` ผู้ใช้ทั่วไปจะอยู่ใน room ของตนเอง ส่วน Admin/Staff จะอยู่ใน room `operations` สำหรับรับออเดอร์ใหม่ การเปลี่ยนสถานะ และการยกเลิกออเดอร์

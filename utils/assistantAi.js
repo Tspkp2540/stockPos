@@ -35,6 +35,38 @@ const extractOutputText = (payload) => {
   return parts.join('\n').trim();
 };
 
+const providerFailure = (status, payload = {}) => {
+  const upstreamCode = String(payload?.error?.code || '').toLowerCase();
+  const upstreamType = String(payload?.error?.type || '').toLowerCase();
+  const error = new Error('ไม่สามารถติดต่อผู้ช่วย AI ได้ในขณะนี้');
+  error.statusCode = 502;
+  error.code = 'ASSISTANT_PROVIDER_ERROR';
+  error.provider = { status, code: upstreamCode || null, type: upstreamType || null };
+
+  if (status === 401) {
+    error.statusCode = 503;
+    error.code = 'ASSISTANT_API_KEY_INVALID';
+    error.message = 'คีย์ OpenAI ไม่ถูกต้อง หมดอายุ หรือถูกปิดใช้งาน';
+  } else if (status === 403) {
+    error.statusCode = 503;
+    error.code = 'ASSISTANT_MODEL_FORBIDDEN';
+    error.message = 'โปรเจกต์ OpenAI นี้ไม่มีสิทธิ์ใช้โมเดลที่ตั้งค่าไว้';
+  } else if (status === 404 || upstreamCode === 'model_not_found') {
+    error.statusCode = 503;
+    error.code = 'ASSISTANT_MODEL_UNAVAILABLE';
+    error.message = 'ไม่พบโมเดล AI ที่ตั้งค่าไว้ กรุณาตรวจสอบ OPENAI_ASSISTANT_MODEL';
+  } else if (status === 429 || upstreamCode === 'insufficient_quota') {
+    error.statusCode = 503;
+    error.code = 'ASSISTANT_QUOTA_EXHAUSTED';
+    error.message = 'โควตาหรือเครดิต OpenAI ไม่เพียงพอ กรุณาตรวจสอบ Billing และ Usage';
+  } else if (status === 400) {
+    error.statusCode = 503;
+    error.code = 'ASSISTANT_PROVIDER_CONFIGURATION';
+    error.message = 'การตั้งค่าผู้ช่วย AI ถูก OpenAI ปฏิเสธ กรุณาตรวจสอบโมเดลและสิทธิ์ของคีย์';
+  }
+  return error;
+};
+
 async function askSystemAssistant({ apiKey, model = 'gpt-5-mini', userId, role, view, question, fetchImpl = global.fetch }) {
   const cleanQuestion = normalizeQuestion(question);
   if (!cleanQuestion) {
@@ -74,10 +106,7 @@ async function askSystemAssistant({ apiKey, model = 'gpt-5-mini', userId, role, 
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const error = new Error('ไม่สามารถติดต่อผู้ช่วย AI ได้ในขณะนี้');
-      error.statusCode = response.status === 401 || response.status === 403 ? 503 : 502;
-      error.code = 'ASSISTANT_PROVIDER_ERROR';
-      throw error;
+      throw providerFailure(response.status, payload);
     }
     const answer = extractOutputText(payload);
     if (!answer) {
@@ -94,10 +123,16 @@ async function askSystemAssistant({ apiKey, model = 'gpt-5-mini', userId, role, 
       timeoutError.code = 'ASSISTANT_TIMEOUT';
       throw timeoutError;
     }
+    if (!error.statusCode && error instanceof TypeError) {
+      const networkError = new Error('Backend ไม่สามารถเชื่อมต่อ OpenAI ได้ กรุณาตรวจสอบเครือข่ายของบริการ');
+      networkError.statusCode = 503;
+      networkError.code = 'ASSISTANT_NETWORK_ERROR';
+      throw networkError;
+    }
     throw error;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-module.exports = { askSystemAssistant, extractOutputText, normalizeQuestion, normalizeView, safetyIdentifierFor };
+module.exports = { askSystemAssistant, extractOutputText, normalizeQuestion, normalizeView, providerFailure, safetyIdentifierFor };
