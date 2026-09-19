@@ -176,6 +176,20 @@ Frontend จะแนบ `Idempotency-Key` ที่มีความยาว 
 
 เมื่อกำหนด `API_PAYLOAD_ENCRYPTION_ENABLED=true` Backend จะรับ payload และตอบ JSON ของ API ที่มี Bearer session เป็น AES-256-GCM envelope โดยผูกกับ token และ HTTP method/path เดียวกัน จึงแก้ไขหรือย้าย payload ไปใช้กับ endpoint อื่นไม่ได้ Frontend ที่จะใช้งานต้อง build พร้อม `VITE_API_PAYLOAD_ENCRYPTION_ENABLED=true` เสมอ ส่วน login, register, health check, public lookup และ Socket.IO ใช้ HTTPS/TLS ตามปกติ เนื่องจากยังไม่มี session token สำหรับสร้าง envelope และ development ปิดความสามารถนี้ไว้
 
+### ผู้ช่วย AI ในระบบ
+
+`POST /api/assistant/chat` เป็นผู้ช่วยแบบอ่านอย่างเดียวสำหรับผู้ที่เข้าสู่ระบบแล้ว ระบบส่งเพียงบทบาท หน้าปัจจุบัน และคำถาม ไม่ส่งข้อมูลลูกค้า ออเดอร์ หรือฐานข้อมูลทั้งหมดไปยังผู้ให้บริการ AI ผู้ช่วยไม่สามารถบันทึก แก้ไข หรือลบข้อมูลได้ และจำกัดการเรียก 30 ครั้งต่อผู้ใช้ต่อ 10 นาที
+
+เปิดใช้บน Backend ด้วยค่า Railway ดังนี้:
+
+```env
+AI_ASSISTANT_ENABLED=true
+OPENAI_API_KEY=...
+OPENAI_ASSISTANT_MODEL=gpt-5-mini
+```
+
+เก็บ `OPENAI_API_KEY` เฉพาะใน Railway Backend ห้ามใส่ใน Frontend หรือ commit ลง Git ระบบส่งคำขอด้วย OpenAI Responses API โดยตั้ง `store: false` เพื่อไม่เก็บบทสนทนาไว้ที่ผู้ให้บริการ
+
 ## Real-time events
 
 Client เชื่อมต่อ Socket.IO โดยส่ง token ใน `auth.token` ผู้ใช้ทั่วไปจะอยู่ใน room ของตนเอง ส่วน Admin/Staff จะอยู่ใน room `operations` สำหรับรับออเดอร์ใหม่ การเปลี่ยนสถานะ และการยกเลิกออเดอร์

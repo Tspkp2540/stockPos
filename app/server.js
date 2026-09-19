@@ -27,6 +27,7 @@ const {
 } = require('../utils/commerceRules');
 const { permissionActions, permissionMenus, ROLE_PERMISSION_DEFAULTS, sanitizePermissions } = require('../utils/rolePermissions');
 const { settlePayments } = require('../utils/paymentSettlement');
+const { askSystemAssistant } = require('../utils/assistantAi');
 
 const promotionDiscountForAmount = (promotion, amount) => {
   const base = Math.max(0, Number(amount) || 0);
@@ -143,6 +144,13 @@ const protectedLookupRateLimiter = createRateLimiter({
   max: 90,
   key: (req) => req.user?.sub ? `user:${req.user.sub}` : clientAddress(req),
 });
+const assistantRateLimiter = createRateLimiter({
+  name: 'assistant',
+  windowMs: 10 * 60 * 1000,
+  max: 30,
+  key: (req) => req.user?.sub ? `user:${req.user.sub}` : clientAddress(req),
+});
+const assistantEnabled = process.env.AI_ASSISTANT_ENABLED === 'true';
 
 const isValidRecordDate = (value) => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -982,6 +990,36 @@ app.post('/api/auth/verify-password', requireAuth, sessionUnlockRateLimiter, asy
     return res.json({ success: true, data: { verified: true } });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// The assistant is read-only: it receives only the user's role, current screen,
+// and question. Store=false prevents chat content from being kept by the provider.
+app.post('/api/assistant/chat', requireAuth, assistantRateLimiter, async (req, res) => {
+  if (!assistantEnabled || !process.env.OPENAI_API_KEY) {
+    return res.status(503).json({
+      success: false,
+      error: 'ผู้ช่วย AI ยังไม่ได้เปิดใช้งานในระบบ',
+      code: 'ASSISTANT_NOT_CONFIGURED',
+    });
+  }
+  try {
+    const result = await askSystemAssistant({
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_ASSISTANT_MODEL || 'gpt-5-mini',
+      userId: req.user.sub,
+      role: req.user.roleKey || req.user.role,
+      view: req.body?.current_view,
+      question: req.body?.question,
+    });
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    const statusCode = Number(error.statusCode) || 502;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.message || 'ไม่สามารถตอบคำถามได้ในขณะนี้',
+      code: error.code || 'ASSISTANT_ERROR',
+    });
   }
 });
 
