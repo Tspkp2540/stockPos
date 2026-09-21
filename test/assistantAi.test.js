@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { askSystemAssistant, extractOutputText, normalizeView, providerFailure, safetyIdentifierFor } = require('../utils/assistantAi');
+const { askSystemAssistant, extractOutputText, extractOllamaText, normalizeView, providerFailure, safetyIdentifierFor } = require('../utils/assistantAi');
 
 test('extractOutputText reads a Responses API output message', () => {
   assert.equal(extractOutputText({ output: [{ content: [{ type: 'output_text', text: 'ตอบแล้ว' }] }] }), 'ตอบแล้ว');
@@ -22,8 +22,34 @@ test('assistant sanitizes the view and sends only its bounded question', async (
   assert.equal(request.safety_identifier, safetyIdentifierFor(42));
 });
 
+test('assistant sends the handbook to Ollama through the private chat API', async () => {
+  let url;
+  let options;
+  const result = await askSystemAssistant({
+    provider: 'ollama',
+    ollamaBaseUrl: 'http://ollama.railway.internal:11434/',
+    model: 'llama3.2:1b',
+    role: 'staff', view: 'pos', question: 'รับออเดอร์อย่างไร',
+    fetchImpl: async (nextUrl, nextOptions) => {
+      url = nextUrl;
+      options = nextOptions;
+      return { ok: true, json: async () => ({ model: 'llama3.2:1b', message: { content: 'เลือกเมนูใน POS' } }) };
+    },
+  });
+  const request = JSON.parse(options.body);
+  assert.equal(url, 'http://ollama.railway.internal:11434/api/chat');
+  assert.equal(options.headers.Authorization, undefined);
+  assert.equal(request.stream, false);
+  assert.equal(request.messages[0].role, 'system');
+  assert.match(request.messages[0].content, /StockPOS handbook/);
+  assert.equal(request.messages[1].content, 'รับออเดอร์อย่างไร');
+  assert.deepEqual(result, { answer: 'เลือกเมนูใน POS', model: 'llama3.2:1b', provider: 'ollama' });
+  assert.equal(extractOllamaText({ message: { content: 'ตอบแล้ว' } }), 'ตอบแล้ว');
+});
+
 test('assistant rejects missing configuration and questions that are too long', async () => {
   await assert.rejects(() => askSystemAssistant({ question: 'ช่วยด้วย' }), { code: 'ASSISTANT_NOT_CONFIGURED' });
+  await assert.rejects(() => askSystemAssistant({ provider: 'ollama', question: 'ช่วยด้วย' }), { code: 'ASSISTANT_OLLAMA_NOT_CONFIGURED' });
   await assert.rejects(() => askSystemAssistant({ apiKey: 'key', question: 'ก'.repeat(801) }), { code: 'ASSISTANT_QUESTION_TOO_LONG' });
   assert.equal(normalizeView('kitchen'), 'kitchen');
   assert.equal(normalizeView('unknown'), 'home');

@@ -151,6 +151,12 @@ const assistantRateLimiter = createRateLimiter({
   key: (req) => req.user?.sub ? `user:${req.user.sub}` : clientAddress(req),
 });
 const assistantEnabled = process.env.AI_ASSISTANT_ENABLED === 'true';
+const assistantProvider = String(process.env.AI_ASSISTANT_PROVIDER || 'openai').trim().toLowerCase();
+const assistantConfigured = () => assistantEnabled && (
+  assistantProvider === 'ollama'
+    ? Boolean(process.env.OLLAMA_BASE_URL)
+    : assistantProvider === 'openai' && Boolean(process.env.OPENAI_API_KEY)
+);
 
 const isValidRecordDate = (value) => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -994,19 +1000,26 @@ app.post('/api/auth/verify-password', requireAuth, sessionUnlockRateLimiter, asy
 });
 
 // The assistant is read-only: it receives only the user's role, current screen,
-// and question. Store=false prevents chat content from being kept by the provider.
+// and question. The StockPOS handbook is attached by the selected provider.
 app.post('/api/assistant/chat', requireAuth, assistantRateLimiter, async (req, res) => {
-  if (!assistantEnabled || !process.env.OPENAI_API_KEY) {
+  if (!assistantConfigured()) {
     return res.status(503).json({
       success: false,
-      error: 'ผู้ช่วย AI ยังไม่ได้เปิดใช้งานในระบบ',
+      error: assistantProvider !== 'openai' && assistantProvider !== 'ollama'
+        ? 'ผู้ให้บริการ AI ที่เลือกไม่รองรับ'
+        : 'ผู้ช่วย AI ยังไม่ได้เปิดใช้งานหรือกำหนดค่าไม่ครบ',
       code: 'ASSISTANT_NOT_CONFIGURED',
     });
   }
   try {
     const result = await askSystemAssistant({
+      provider: assistantProvider,
       apiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_ASSISTANT_MODEL || 'gpt-5-mini',
+      model: assistantProvider === 'ollama'
+        ? process.env.OLLAMA_ASSISTANT_MODEL || 'llama3.2:1b'
+        : process.env.OPENAI_ASSISTANT_MODEL || 'gpt-5-mini',
+      ollamaBaseUrl: process.env.OLLAMA_BASE_URL,
+      timeoutMs: process.env.AI_ASSISTANT_TIMEOUT_MS,
       userId: req.user.sub,
       role: req.user.roleKey || req.user.role,
       view: req.body?.current_view,

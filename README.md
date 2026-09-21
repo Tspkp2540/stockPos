@@ -178,19 +178,36 @@ Frontend จะแนบ `Idempotency-Key` ที่มีความยาว 
 
 ### ผู้ช่วย AI ในระบบ
 
-`POST /api/assistant/chat` เป็นผู้ช่วยแบบอ่านอย่างเดียวสำหรับผู้ที่เข้าสู่ระบบแล้ว ระบบส่งเพียงบทบาท หน้าปัจจุบัน และคำถาม ไม่ส่งข้อมูลลูกค้า ออเดอร์ หรือฐานข้อมูลทั้งหมดไปยังผู้ให้บริการ AI ผู้ช่วยไม่สามารถบันทึก แก้ไข หรือลบข้อมูลได้ และจำกัดการเรียก 30 ครั้งต่อผู้ใช้ต่อ 10 นาที
+`POST /api/assistant/chat` เป็นผู้ช่วยแบบอ่านอย่างเดียวสำหรับผู้ที่เข้าสู่ระบบแล้ว ระบบส่งเพียงบทบาท หน้าปัจจุบัน และคำถาม ไม่ส่งข้อมูลลูกค้า ออเดอร์ หรือฐานข้อมูลทั้งหมดไปยังผู้ให้บริการ AI ผู้ช่วยไม่สามารถบันทึก แก้ไข หรือลบข้อมูลได้ และจำกัดการเรียก 30 ครั้งต่อผู้ใช้ต่อ 10 นาที หน้าเว็บมีปุ่ม **คู่มือ** ที่ค้นหาคู่มือในระบบโดยไม่เรียก AI จึงยังใช้งานได้แม้ Ollama, OpenAI หรือเครือข่ายไม่พร้อม
 
-เปิดใช้บน Backend ด้วยค่า Railway ดังนี้:
+คู่มือ StockPOS เดียวกันถูกแนบเป็นความรู้ประกอบทุกครั้งที่ AI ตอบ เพื่อให้ตอบตามขั้นตอน POS, ครัว, โต๊ะ, สต็อก, การเงิน และสิทธิ์ของบัญชีได้ทันที วิธีนี้เป็นการป้อนความรู้ (grounding) ไม่ใช่การฝึกหรือแก้น้ำหนักโมเดล จึงไม่เก็บคำถามไว้ในโมเดลและแก้ไขคู่มือแล้วมีผลทันที
+
+### ใช้ Ollama ภายใน Railway (แนะนำเมื่อมี Ollama แล้ว)
+
+ให้ pull โมเดลในบริการ `ollama` ก่อน เช่น `llama3.2:1b` แล้วกำหนด Variables ในบริการ **StockPOS Backend** ดังนี้ โดยใช้ชื่อโมเดลให้ตรงกับ `ollama list`:
 
 ```env
 AI_ASSISTANT_ENABLED=true
+AI_ASSISTANT_PROVIDER=ollama
+OLLAMA_BASE_URL=http://${{ollama.RAILWAY_PRIVATE_DOMAIN}}:11434
+OLLAMA_ASSISTANT_MODEL=llama3.2:1b
+AI_ASSISTANT_TIMEOUT_MS=90000
+```
+
+เปลี่ยน `ollama` ใน URL ให้ตรงกับชื่อบริการ Ollama ใน Railway หากตั้งชื่ออื่น แล้ว redeploy เฉพาะ Backend ก็พอ URL นี้เป็น private network ระหว่างบริการ จึงไม่ควรเปิด Ollama สู่ public internet และไม่ต้องใส่ `OPENAI_API_KEY` หรือใช้เครดิต OpenAI
+
+### ใช้ OpenAI แทน
+
+```env
+AI_ASSISTANT_ENABLED=true
+AI_ASSISTANT_PROVIDER=openai
 OPENAI_API_KEY=...
 OPENAI_ASSISTANT_MODEL=gpt-5-mini
 ```
 
 เก็บ `OPENAI_API_KEY` เฉพาะใน Railway Backend ห้ามใส่ใน Frontend หรือ commit ลง Git ระบบส่งคำขอด้วย OpenAI Responses API โดยตั้ง `store: false` เพื่อไม่เก็บบทสนทนาไว้ที่ผู้ให้บริการ
 
-หากผู้ช่วยตอบด้วยรหัสผิดพลาด ให้ตรวจสอบตามนี้: `ASSISTANT_API_KEY_INVALID` = คีย์ผิดหรือถูกปิด, `ASSISTANT_QUOTA_EXHAUSTED` = ยังไม่ได้เปิด Billing/เครดิตไม่พอ, `ASSISTANT_MODEL_UNAVAILABLE` = ชื่อโมเดลไม่พร้อมใช้กับ Project, และ `ASSISTANT_NETWORK_ERROR` = Railway ติดต่อ OpenAI ไม่ได้ ระบบจะบันทึกเฉพาะ HTTP status และรหัสผิดพลาดใน Railway log โดยไม่บันทึกคีย์หรือคำถาม
+หากผู้ช่วยตอบด้วยรหัสผิดพลาด ให้ตรวจสอบตามนี้: `ASSISTANT_MODEL_UNAVAILABLE` = ชื่อโมเดลไม่ตรงหรือยัง pull ไม่เสร็จ, `ASSISTANT_OLLAMA_NOT_CONFIGURED` = ไม่มี `OLLAMA_BASE_URL`, `ASSISTANT_NETWORK_ERROR` = Backend ติดต่อ Ollama/OpenAI ไม่ได้, `ASSISTANT_TIMEOUT` = Ollama บน CPU ตอบช้าเกินกำหนด และ `ASSISTANT_QUOTA_EXHAUSTED` ใช้เฉพาะ OpenAI เมื่อเครดิตไม่พอ ระบบจะบันทึกเฉพาะ HTTP status และรหัสผิดพลาดใน Railway log โดยไม่บันทึกคีย์หรือคำถาม
 
 ## Real-time events
 
