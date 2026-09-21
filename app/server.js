@@ -28,6 +28,7 @@ const {
 const { permissionActions, permissionMenus, ROLE_PERMISSION_DEFAULTS, sanitizePermissions } = require('../utils/rolePermissions');
 const { settlePayments } = require('../utils/paymentSettlement');
 const { askSystemAssistant } = require('../utils/assistantAi');
+const { allowedAssistantScopes, buildAssistantContext } = require('../utils/assistantContext');
 
 const promotionDiscountForAmount = (promotion, amount) => {
   const base = Math.max(0, Number(amount) || 0);
@@ -1012,6 +1013,12 @@ app.post('/api/assistant/chat', requireAuth, assistantRateLimiter, async (req, r
     });
   }
   try {
+    const permissions = await rolePermissionsFor(req.user.roleKey || req.user.role);
+    const contextScopes = allowedAssistantScopes(req.body?.context_scopes, {
+      role: req.user.role,
+      permissions,
+    });
+    const systemContext = await buildAssistantContext(pool, contextScopes, req.user.sub);
     const result = await askSystemAssistant({
       provider: assistantProvider,
       apiKey: process.env.OPENAI_API_KEY,
@@ -1024,8 +1031,10 @@ app.post('/api/assistant/chat', requireAuth, assistantRateLimiter, async (req, r
       role: req.user.roleKey || req.user.role,
       view: req.body?.current_view,
       question: req.body?.question,
+      history: req.body?.history,
+      systemContext,
     });
-    return res.json({ success: true, data: result });
+    return res.json({ success: true, data: { ...result, context_scopes: contextScopes } });
   } catch (error) {
     const statusCode = Number(error.statusCode) || 502;
     console.error('AI assistant request failed', {

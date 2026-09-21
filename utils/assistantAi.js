@@ -8,11 +8,25 @@ const ALLOWED_VIEWS = new Set([
 ]);
 const SUPPORTED_PROVIDERS = new Set(['openai', 'ollama']);
 const MAX_QUESTION_LENGTH = 800;
+const MAX_HISTORY_MESSAGES = 6;
+const MAX_HISTORY_MESSAGE_LENGTH = 700;
 
 const normalizeQuestion = (value) => String(value || '').trim().replace(/\s+/g, ' ');
 const normalizeView = (value) => ALLOWED_VIEWS.has(String(value || '')) ? String(value) : 'home';
 const normalizeProvider = (value) => SUPPORTED_PROVIDERS.has(String(value || '').toLowerCase())
   ? String(value).toLowerCase() : 'openai';
+const normalizeHistory = (value) => (Array.isArray(value) ? value : [])
+  .filter((item) => item && ['user', 'assistant'].includes(String(item.role || '').toLowerCase()))
+  .slice(-MAX_HISTORY_MESSAGES)
+  .map((item) => ({
+    role: String(item.role).toLowerCase(),
+    content: normalizeQuestion(item.content).slice(0, MAX_HISTORY_MESSAGE_LENGTH),
+  }))
+  .filter((item) => item.content);
+const normalizeSystemContext = (value) => (Array.isArray(value) ? value : [])
+  .map((item) => normalizeQuestion(item).slice(0, 500))
+  .filter(Boolean)
+  .slice(0, 5);
 const safetyIdentifierFor = (userId) => crypto.createHash('sha256')
   .update(`stockpos-assistant:${String(userId || 'unknown')}`)
   .digest('hex')
@@ -95,7 +109,7 @@ const configurationError = (code, message) => {
 };
 
 async function askSystemAssistant({
-  provider = 'openai', apiKey, model, ollamaBaseUrl, userId, role, view, question,
+  provider = 'openai', apiKey, model, ollamaBaseUrl, userId, role, view, question, history, systemContext,
   timeoutMs, fetchImpl = global.fetch,
 }) {
   const cleanQuestion = normalizeQuestion(question);
@@ -122,6 +136,14 @@ async function askSystemAssistant({
   const timeout = setTimeout(() => controller.abort(), Number(timeoutMs) || (selectedProvider === 'ollama' ? 90000 : 20000));
   const safeRole = String(role || 'USER').toUpperCase();
   const safeView = normalizeView(view);
+  const safeHistory = normalizeHistory(history);
+  const safeSystemContext = normalizeSystemContext(systemContext);
+  const messages = [
+    { role: 'system', content: instructionsFor({ role: safeRole, view: safeView }) },
+    ...(safeSystemContext.length ? [{ role: 'system', content: `The user explicitly allowed these aggregate system summaries for this response only:\n${safeSystemContext.join('\n')}` }] : []),
+    ...safeHistory,
+    { role: 'user', content: cleanQuestion },
+  ];
   try {
     if (selectedProvider === 'ollama') {
       const baseUrl = String(ollamaBaseUrl).trim().replace(/\/+$/, '');
@@ -129,10 +151,7 @@ async function askSystemAssistant({
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
         body: JSON.stringify({
           model: selectedModel, stream: false, keep_alive: '5m', options: { temperature: 0.2, num_predict: 450 },
-          messages: [
-            { role: 'system', content: instructionsFor({ role: safeRole, view: safeView }) },
-            { role: 'user', content: cleanQuestion },
-          ],
+          messages,
         }),
       });
       const payload = await response.json().catch(() => ({}));
@@ -145,7 +164,12 @@ async function askSystemAssistant({
       method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, signal: controller.signal,
       body: JSON.stringify({
         model: selectedModel, store: false, max_output_tokens: 450, safety_identifier: safetyIdentifierFor(userId),
-        instructions: instructionsFor({ role: safeRole, view: safeView }), input: cleanQuestion,
+        instructions: instructionsFor({ role: safeRole, view: safeView }),
+        input: [
+          ...safeHistory,
+          ...(safeSystemContext.length ? [{ role: 'developer', content: `Authorised aggregate system summaries for this response only:\n${safeSystemContext.join('\n')}` }] : []),
+          { role: 'user', content: cleanQuestion },
+        ],
       }),
     });
     const payload = await response.json().catch(() => ({}));
@@ -174,5 +198,5 @@ async function askSystemAssistant({
 
 module.exports = {
   askSystemAssistant, extractOutputText, extractOllamaText, normalizeQuestion, normalizeView,
-  normalizeProvider, providerFailure, safetyIdentifierFor, STOCKPOS_HANDBOOK,
+  normalizeProvider, normalizeHistory, normalizeSystemContext, providerFailure, safetyIdentifierFor, STOCKPOS_HANDBOOK,
 };

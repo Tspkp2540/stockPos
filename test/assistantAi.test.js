@@ -16,7 +16,7 @@ test('assistant sanitizes the view and sends only its bounded question', async (
     },
   });
   assert.equal(result.answer, 'ไปหน้า POS');
-  assert.equal(request.input, 'เปิด ออเดอร์ อย่างไร');
+  assert.deepEqual(request.input, [{ role: 'user', content: 'เปิด ออเดอร์ อย่างไร' }]);
   assert.match(request.instructions, /current screen is home/);
   assert.equal(request.store, false);
   assert.equal(request.safety_identifier, safetyIdentifierFor(42));
@@ -45,6 +45,21 @@ test('assistant sends the handbook to Ollama through the private chat API', asyn
   assert.equal(request.messages[1].content, 'รับออเดอร์อย่างไร');
   assert.deepEqual(result, { answer: 'เลือกเมนูใน POS', model: 'llama3.2:1b', provider: 'ollama' });
   assert.equal(extractOllamaText({ message: { content: 'ตอบแล้ว' } }), 'ตอบแล้ว');
+});
+
+test('assistant limits chat history and sends approved aggregate context', async () => {
+  let request;
+  await askSystemAssistant({
+    provider: 'ollama', ollamaBaseUrl: 'http://ollama:11434', question: 'สรุปให้หน่อย',
+    history: Array.from({ length: 8 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `ข้อความ ${index}` })),
+    systemContext: ['ออเดอร์ค้าง 2 รายการ'],
+    fetchImpl: async (_url, options) => {
+      request = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ message: { content: 'สรุปแล้ว' } }) };
+    },
+  });
+  assert.equal(request.messages.filter((message) => message.role === 'user' || message.role === 'assistant').length, 7);
+  assert.match(request.messages[1].content, /ออเดอร์ค้าง 2 รายการ/);
 });
 
 test('assistant rejects missing configuration and questions that are too long', async () => {
