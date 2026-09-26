@@ -1,4 +1,4 @@
 INSERT INTO coupons
   (code, discount_type, discount_value, min_order_amount, max_discount_amount, usage_limit)
 VALUES
-  ('WELCOME10', 'PERCENT', 10, 100, 50, 100);
+  ('WELCOME10', 'PERCENT', 10, 100, 50, 100);add search fuction
